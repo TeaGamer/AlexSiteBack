@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -23,51 +24,52 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization"]
 )
 
-# Конфігурація
-basedir = os.path.abspath(os.path.dirname(__file__))
-database_path = os.path.join(basedir, '..', 'DataBase', 'users.db')
-os.makedirs(os.path.dirname(database_path), exist_ok=True)
-
+# Конфігурація БД
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://localhost/alexsite')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['DATABASE'] = database_path
+
+print(f"📍 Database URL: {DATABASE_URL}")
 
 # ==================== ДОПОМІЖНІ ФУНКЦІЇ БД ====================
 
 def get_db():
     """Отримання з'єднання з базою даних"""
-    db = sqlite3.connect(app.config['DATABASE'])
-    db.row_factory = sqlite3.Row
-    return db
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"❌ Помилка з'єднання з БД: {e}")
+        raise
 
 def init_db():
     """Ініціалізація бази даних"""
-    db = get_db()
-    cursor = db.cursor()
+    conn = get_db()
+    cursor = conn.cursor()
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            login TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            first_name TEXT NOT NULL,
-            last_name TEXT NOT NULL,
-            date_of_birth TEXT,
-            region TEXT,
-            is_active BOOLEAN DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    ''')
-    
-    db.commit()
-    db.close()
-
-def dict_from_row(row):
-    """Конвертація рядка БД в словник"""
-    if row is None:
-        return None
-    return dict(row)
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                login TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                date_of_birth TEXT,
+                region TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        print("✓ Таблиця users готова")
+    except Exception as e:
+        print(f"❌ Помилка ініціалізації БД: {e}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
 
 # ==================== МОДЕЛІ ====================
 
@@ -75,101 +77,118 @@ class User:
     @staticmethod
     def find_by_login(login):
         """Пошук користувача за логіном"""
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute('SELECT * FROM users WHERE login = ?', (login,))
-        user = dict_from_row(cursor.fetchone())
-        db.close()
-        return user
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute('SELECT * FROM users WHERE login = %s', (login,))
+            user = cursor.fetchone()
+            return dict(user) if user else None
+        finally:
+            cursor.close()
+            conn.close()
     
     @staticmethod
     def find_by_email(email):
         """Пошук користувача за email"""
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute('SELECT * FROM users WHERE email = ?', (email,))
-        user = dict_from_row(cursor.fetchone())
-        db.close()
-        return user
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute('SELECT * FROM users WHERE email = %s', (email,))
+            user = cursor.fetchone()
+            return dict(user) if user else None
+        finally:
+            cursor.close()
+            conn.close()
     
     @staticmethod
     def find_by_id(user_id):
         """Пошук користувача за ID"""
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-        user = dict_from_row(cursor.fetchone())
-        db.close()
-        return user
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
+            user = cursor.fetchone()
+            return dict(user) if user else None
+        finally:
+            cursor.close()
+            conn.close()
     
     @staticmethod
     def create(login, email, password, first_name, last_name, date_of_birth=None, region=None):
         """Створення нового користувача"""
-        db = get_db()
-        cursor = db.cursor()
+        conn = get_db()
+        cursor = conn.cursor()
         
         password_hash = generate_password_hash(password)
-        now = datetime.utcnow().isoformat()
         
         try:
             cursor.execute('''
-                INSERT INTO users (login, email, password_hash, first_name, last_name, date_of_birth, region, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (login, email, password_hash, first_name, last_name, date_of_birth, region, now, now))
+                INSERT INTO users (login, email, password_hash, first_name, last_name, date_of_birth, region)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            ''', (login, email, password_hash, first_name, last_name, date_of_birth, region or 'Ukraine'))
             
-            db.commit()
-            user_id = cursor.lastrowid
-            db.close()
+            user_id = cursor.fetchone()[0]
+            conn.commit()
             return User.find_by_id(user_id)
-        except sqlite3.IntegrityError as e:
-            db.close()
+        except psycopg2.IntegrityError as e:
+            conn.rollback()
             raise Exception(str(e))
+        finally:
+            cursor.close()
+            conn.close()
     
     @staticmethod
     def update(user_id, **kwargs):
         """Оновлення користувача"""
-        db = get_db()
-        cursor = db.cursor()
+        conn = get_db()
+        cursor = conn.cursor()
         
         allowed_fields = ['email', 'first_name', 'last_name', 'date_of_birth', 'region', 'password_hash']
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
         
         if not updates:
-            db.close()
+            conn.close()
             return User.find_by_id(user_id)
-        
-        updates['updated_at'] = datetime.utcnow().isoformat()
-        
-        set_clause = ', '.join([f'{k} = ?' for k in updates.keys()])
-        values = list(updates.values()) + [user_id]
         
         try:
-            cursor.execute(f'UPDATE users SET {set_clause} WHERE id = ?', values)
-            db.commit()
-            db.close()
+            set_clause = ', '.join([f'{k} = %s' for k in updates.keys()])
+            values = list(updates.values()) + [user_id]
+            
+            cursor.execute(f'UPDATE users SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = %s', values)
+            conn.commit()
             return User.find_by_id(user_id)
-        except sqlite3.IntegrityError as e:
-            db.close()
+        except psycopg2.IntegrityError as e:
+            conn.rollback()
             raise Exception(str(e))
+        finally:
+            cursor.close()
+            conn.close()
     
     @staticmethod
     def delete(user_id):
         """Видалення користувача"""
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
-        db.commit()
-        db.close()
+        conn = get_db()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('DELETE FROM users WHERE id = %s', (user_id,))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
     
     @staticmethod
     def get_all():
         """Отримання всіх користувачів"""
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute('SELECT * FROM users ORDER BY created_at DESC')
-        users = [dict_from_row(row) for row in cursor.fetchall()]
-        db.close()
-        return users
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute('SELECT * FROM users ORDER BY created_at DESC')
+            users = [dict(row) for row in cursor.fetchall()]
+            return users
+        finally:
+            cursor.close()
+            conn.close()
 
 def user_to_dict(user, include_email=True):
     """Конвертація користувача в словник"""
@@ -184,8 +203,8 @@ def user_to_dict(user, include_email=True):
         'date_of_birth': user['date_of_birth'],
         'region': user['region'],
         'is_active': user['is_active'],
-        'created_at': user['created_at'],
-        'updated_at': user['updated_at']
+        'created_at': user['created_at'].isoformat() if isinstance(user['created_at'], datetime) else user['created_at'],
+        'updated_at': user['updated_at'].isoformat() if isinstance(user['updated_at'], datetime) else user['updated_at']
     }
     
     if include_email:
