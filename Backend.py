@@ -9,14 +9,17 @@ from datetime import datetime, timedelta
 # ==================== ІНІЦІАЛІЗАЦІЯ ====================
 
 app = Flask(__name__)
-CORS(app, resources={"*": {"origins": "*"}})
+
+# CORS налаштування
+cors_origins = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:8000').split(',')
+CORS(app, resources={"*": {"origins": cors_origins}})
 
 # Конфігурація
 basedir = os.path.abspath(os.path.dirname(__file__))
 database_path = os.path.join(basedir, '..', 'DataBase', 'users.db')
 os.makedirs(os.path.dirname(database_path), exist_ok=True)
 
-app.config['SECRET_KEY'] = 'your-secret-key-change-in-production'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
 app.config['DATABASE'] = database_path
 
 # ==================== ДОПОМІЖНІ ФУНКЦІЇ БД ====================
@@ -428,8 +431,11 @@ if __name__ == '__main__':
     init_db()
     print("✓ База даних готова")
     
+    port = int(os.environ.get('PORT', 8000))
+    debug_mode = os.environ.get('FLASK_ENV') != 'production'
+    
     print("🚀 Запуск Flask сервера...")
-    print("📍 http://localhost:8000")
+    print(f"📍 http://0.0.0.0:{port}")
     print("💡 Натисніть Ctrl+C для зупинки\n")
     
-    app.run(debug=True, host='0.0.0.0', port=8000)
+    app.run(debug=debug_mode, host='0.0.0.0', port=port)
