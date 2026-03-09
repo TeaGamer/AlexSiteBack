@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from flask_sqlalchemy import SQLAlchemy
 import os
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -25,192 +24,114 @@ CORS(app,
 )
 
 # Конфігурація БД
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://localhost/alexsite')
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///users.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
 
 print(f"📍 Database URL: {DATABASE_URL}")
 
-# ==================== ДОПОМІЖНІ ФУНКЦІЇ БД ====================
-
-def get_db():
-    """Отримання з'єднання з базою даних"""
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        print(f"❌ Помилка з'єднання з БД: {e}")
-        raise
-
-def init_db():
-    """Ініціалізація бази даних"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                login TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                first_name TEXT NOT NULL,
-                last_name TEXT NOT NULL,
-                date_of_birth TEXT,
-                region TEXT,
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-        print("✓ Таблиця users готова")
-    except Exception as e:
-        print(f"❌ Помилка ініціалізації БД: {e}")
-        conn.rollback()
-    finally:
-        cursor.close()
-        conn.close()
+db = SQLAlchemy(app)
 
 # ==================== МОДЕЛІ ====================
 
-class User:
+class User(db.Model):
+    """Модель користувача"""
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    login = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    first_name = db.Column(db.String(120), nullable=False)
+    last_name = db.Column(db.String(120), nullable=False)
+    date_of_birth = db.Column(db.String(20))
+    region = db.Column(db.String(120), default='Ukraine')
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
     @staticmethod
     def find_by_login(login):
         """Пошук користувача за логіном"""
-        conn = get_db()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            cursor.execute('SELECT * FROM users WHERE login = %s', (login,))
-            user = cursor.fetchone()
-            return dict(user) if user else None
-        finally:
-            cursor.close()
-            conn.close()
+        return User.query.filter_by(login=login).first()
     
     @staticmethod
     def find_by_email(email):
         """Пошук користувача за email"""
-        conn = get_db()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            cursor.execute('SELECT * FROM users WHERE email = %s', (email,))
-            user = cursor.fetchone()
-            return dict(user) if user else None
-        finally:
-            cursor.close()
-            conn.close()
+        return User.query.filter_by(email=email).first()
     
     @staticmethod
     def find_by_id(user_id):
         """Пошук користувача за ID"""
-        conn = get_db()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
-            user = cursor.fetchone()
-            return dict(user) if user else None
-        finally:
-            cursor.close()
-            conn.close()
+        return User.query.get(user_id)
     
     @staticmethod
     def create(login, email, password, first_name, last_name, date_of_birth=None, region=None):
         """Створення нового користувача"""
-        conn = get_db()
-        cursor = conn.cursor()
-        
         password_hash = generate_password_hash(password)
-        
-        try:
-            cursor.execute('''
-                INSERT INTO users (login, email, password_hash, first_name, last_name, date_of_birth, region)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            ''', (login, email, password_hash, first_name, last_name, date_of_birth, region or 'Ukraine'))
-            
-            user_id = cursor.fetchone()[0]
-            conn.commit()
-            return User.find_by_id(user_id)
-        except psycopg2.IntegrityError as e:
-            conn.rollback()
-            raise Exception(str(e))
-        finally:
-            cursor.close()
-            conn.close()
+        user = User(
+            login=login,
+            email=email,
+            password_hash=password_hash,
+            first_name=first_name,
+            last_name=last_name,
+            date_of_birth=date_of_birth,
+            region=region or 'Ukraine'
+        )
+        db.session.add(user)
+        db.session.commit()
+        return user
     
     @staticmethod
     def update(user_id, **kwargs):
         """Оновлення користувача"""
-        conn = get_db()
-        cursor = conn.cursor()
+        user = User.query.get(user_id)
+        if not user:
+            return None
         
         allowed_fields = ['email', 'first_name', 'last_name', 'date_of_birth', 'region', 'password_hash']
-        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        for key, value in kwargs.items():
+            if key in allowed_fields and value is not None:
+                setattr(user, key, value)
         
-        if not updates:
-            conn.close()
-            return User.find_by_id(user_id)
-        
-        try:
-            set_clause = ', '.join([f'{k} = %s' for k in updates.keys()])
-            values = list(updates.values()) + [user_id]
-            
-            cursor.execute(f'UPDATE users SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = %s', values)
-            conn.commit()
-            return User.find_by_id(user_id)
-        except psycopg2.IntegrityError as e:
-            conn.rollback()
-            raise Exception(str(e))
-        finally:
-            cursor.close()
-            conn.close()
+        user.updated_at = datetime.utcnow()
+        db.session.commit()
+        return user
     
     @staticmethod
     def delete(user_id):
         """Видалення користувача"""
-        conn = get_db()
-        cursor = conn.cursor()
-        try:
-            cursor.execute('DELETE FROM users WHERE id = %s', (user_id,))
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
+        user = User.query.get(user_id)
+        if user:
+            db.session.delete(user)
+            db.session.commit()
+            return True
+        return False
     
     @staticmethod
     def get_all():
         """Отримання всіх користувачів"""
-        conn = get_db()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            cursor.execute('SELECT * FROM users ORDER BY created_at DESC')
-            users = [dict(row) for row in cursor.fetchall()]
-            return users
-        finally:
-            cursor.close()
-            conn.close()
-
-def user_to_dict(user, include_email=True):
-    """Конвертація користувача в словник"""
-    if not user:
-        return None
+        return User.query.order_by(User.created_at.desc()).all()
     
-    result = {
-        'id': user['id'],
-        'login': user['login'],
-        'first_name': user['first_name'],
-        'last_name': user['last_name'],
-        'date_of_birth': user['date_of_birth'],
-        'region': user['region'],
-        'is_active': user['is_active'],
-        'created_at': user['created_at'].isoformat() if isinstance(user['created_at'], datetime) else user['created_at'],
-        'updated_at': user['updated_at'].isoformat() if isinstance(user['updated_at'], datetime) else user['updated_at']
-    }
-    
-    if include_email:
-        result['email'] = user['email']
-    
-    return result
+    def to_dict(self, include_email=True):
+        """Конвертація користувача в словник"""
+        result = {
+            'id': self.id,
+            'login': self.login,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'date_of_birth': self.date_of_birth,
+            'region': self.region,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+        }
+        
+        if include_email:
+            result['email'] = self.email
+        
+        return result
 
 # ==================== JWT ТОКЕНИ ====================
 
@@ -238,7 +159,6 @@ def get_current_user_id(request):
     
     token = auth_header.split(' ')[1]
     return verify_token(token)
-
 
 # ==================== API МАРШРУТИ ====================
 
@@ -282,15 +202,16 @@ def register():
             region=data.get('region', 'Ukraine')
         )
         
-        token = generate_token(user['id'])
+        token = generate_token(user.id)
         
         return jsonify({
             'message': 'Реєстрація пройшла успішно',
-            'user': user_to_dict(user),
+            'user': user.to_dict(),
             'token': token
         }), 201
     
     except Exception as e:
+        db.session.rollback()
         return jsonify({'error': f'Помилка реєстрації: {str(e)}'}), 500
 
 # >>>>>>>>>> ВХІД >>>>>>>>>>
@@ -312,14 +233,14 @@ def login():
         if not user:
             user = User.find_by_email(data['login'])
         
-        if not user or not check_password_hash(user['password_hash'], data['password']):
+        if not user or not check_password_hash(user.password_hash, data['password']):
             return jsonify({'error': 'Невірні облікові дані'}), 401
         
-        token = generate_token(user['id'])
+        token = generate_token(user.id)
         
         return jsonify({
             'message': 'Вхід успішний',
-            'user': user_to_dict(user),
+            'user': user.to_dict(),
             'token': token
         }), 200
     
@@ -342,7 +263,7 @@ def get_profile():
     if not user:
         return jsonify({'error': 'Користувача не знайдено'}), 404
     
-    return jsonify({'user': user_to_dict(user)}), 200
+    return jsonify({'user': user.to_dict()}), 200
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
 def update_profile():
@@ -364,7 +285,7 @@ def update_profile():
         
         if 'email' in data:
             existing = User.find_by_email(data['email'])
-            if existing and existing['id'] != user_id:
+            if existing and existing.id != user_id:
                 return jsonify({'error': 'Цей email вже використовується'}), 409
             updates['email'] = data['email']
         
@@ -389,10 +310,11 @@ def update_profile():
         
         return jsonify({
             'message': 'Профіль оновлено',
-            'user': user_to_dict(updated_user)
+            'user': updated_user.to_dict()
         }), 200
     
     except Exception as e:
+        db.session.rollback()
         return jsonify({'error': f'Помилка оновлення: {str(e)}'}), 500
 
 # >>>>>>>>>> КОРИСТУВАЧІ >>>>>>>>>>
@@ -406,7 +328,7 @@ def get_users():
     try:
         users = User.get_all()
         return jsonify({
-            'users': [user_to_dict(u, include_email=False) for u in users],
+            'users': [user.to_dict(include_email=False) for user in users],
             'total': len(users)
         }), 200
     except Exception as e:
@@ -422,7 +344,7 @@ def get_user(user_id):
     if not user:
         return jsonify({'error': 'Користувача не знайдено'}), 404
     
-    return jsonify({'user': user_to_dict(user, include_email=False)}), 200
+    return jsonify({'user': user.to_dict(include_email=False)}), 200
 
 # >>>>>>>>>> ВИДАЛЕННЯ ОБЛІКОВОГО ЗАПИСУ >>>>>>>>>>
 
@@ -440,6 +362,7 @@ def delete_account():
         User.delete(user_id)
         return jsonify({'message': 'Обліковий запис видалено'}), 200
     except Exception as e:
+        db.session.rollback()
         return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
 
 # ==================== ОБРОБКА ПОМИЛОК ====================
@@ -455,9 +378,10 @@ def server_error(error):
 # ==================== ЗАПУСК СЕРВЕРА ====================
 
 if __name__ == '__main__':
-    print("🔄 Ініціалізація бази даних...")
-    init_db()
-    print("✓ База даних готова")
+    with app.app_context():
+        print("🔄 Ініціалізація бази даних...")
+        db.create_all()
+        print("✓ База даних готова")
     
     port = int(os.environ.get('PORT', 8000))
     debug_mode = os.environ.get('FLASK_ENV') != 'production'
