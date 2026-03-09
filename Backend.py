@@ -11,8 +11,17 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 # CORS налаштування
-cors_origins = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:8000').split(',')
-CORS(app, resources={"*": {"origins": cors_origins}})
+cors_origins_env = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:8000')
+cors_origins = [origin.strip() for origin in cors_origins_env.split(',')]
+
+print(f"✅ CORS дозволені джерела: {cors_origins}")
+
+CORS(app, 
+     resources={"*": {"origins": cors_origins}},
+     supports_credentials=True,
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"]
+)
 
 # Конфігурація
 basedir = os.path.abspath(os.path.dirname(__file__))
