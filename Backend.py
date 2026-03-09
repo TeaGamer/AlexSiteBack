@@ -25,6 +25,9 @@ CORS(app,
 
 # Конфігурація БД
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///users.db')
+# Конвертація postgresql:// в postgresql+psycopg:// для psycopg3
+if DATABASE_URL.startswith('postgresql://'):
+    DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+psycopg://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
