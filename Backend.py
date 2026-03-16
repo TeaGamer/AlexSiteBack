@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 # CORS налаштування
-cors_origins_env = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:8000')
+cors_origins_env = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:10000,http://localhost:8000,https://alexsite-swzo.onrender.com')
 cors_origins = [origin.strip() for origin in cors_origins_env.split(',')]
 
 print(f"✅ CORS дозволені джерела: {cors_origins}")
