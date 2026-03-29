@@ -5,6 +5,8 @@ import os
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
+import threading
+from pytz import timezone
 
 # ==================== ІНІЦІАЛІЗАЦІЯ ====================
 
@@ -135,6 +137,103 @@ class User(db.Model):
             result['email'] = self.email
         
         return result
+
+# ==================== МОДЕЛЬ ПОДІЙ ====================
+
+class Event(db.Model):
+    """Модель подій календаря"""
+    __tablename__ = 'events'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    start_time = db.Column(db.DateTime, nullable=False)
+    end_time = db.Column(db.DateTime, nullable=False)
+    location = db.Column(db.String(255), nullable=True)
+    reminder = db.Column(db.Boolean, default=True)  # Чи показувати нагадування
+    is_completed = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        """Конвертація події в словник"""
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'title': self.title,
+            'description': self.description,
+            'start_time': self.start_time.isoformat(),
+            'end_time': self.end_time.isoformat(),
+            'location': self.location,
+            'reminder': self.reminder,
+            'is_completed': self.is_completed,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+        }
+    
+    @staticmethod
+    def create(user_id, title, start_time, end_time, description=None, location=None):
+        """Створення нової події"""
+        event = Event(
+            user_id=user_id,
+            title=title,
+            description=description,
+            start_time=start_time,
+            end_time=end_time,
+            location=location
+        )
+        db.session.add(event)
+        db.session.commit()
+        return event
+    
+    @staticmethod
+    def find_by_id(event_id):
+        """Пошук події за ID"""
+        return Event.query.get(event_id)
+    
+    @staticmethod
+    def find_by_user(user_id):
+        """Пошук всих подій користувача"""
+        return Event.query.filter_by(user_id=user_id).order_by(Event.start_time).all()
+    
+    @staticmethod
+    def find_upcoming(user_id, minutes=30):
+        """Пошук близьких подій (за замовчуванням на 30 хв)"""
+        now = datetime.utcnow()
+        future = now + timedelta(minutes=minutes)
+        return Event.query.filter(
+            Event.user_id == user_id,
+            Event.start_time >= now,
+            Event.start_time <= future,
+            Event.is_completed == False
+        ).order_by(Event.start_time).all()
+    
+    @staticmethod
+    def update(event_id, **kwargs):
+        """Оновлення події"""
+        event = Event.query.get(event_id)
+        if not event:
+            return None
+        
+        allowed_fields = ['title', 'description', 'start_time', 'end_time', 'location', 'reminder', 'is_completed']
+        for key, value in kwargs.items():
+            if key in allowed_fields and value is not None:
+                setattr(event, key, value)
+        
+        event.updated_at = datetime.utcnow()
+        db.session.commit()
+        return event
+    
+    @staticmethod
+    def delete(event_id):
+        """Видалення події"""
+        event = Event.query.get(event_id)
+        if event:
+            db.session.delete(event)
+            db.session.commit()
+            return True
+        return False
 
 # ==================== JWT ТОКЕНИ ====================
 
@@ -367,6 +466,225 @@ def delete_account():
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
+
+# ==================== КАЛЕНДАР / ПОДІЇ ====================
+
+@app.route('/api/calendar/current', methods=['GET', 'OPTIONS'])
+def get_calendar_current():
+    """Отримання поточної дати, часу та близьких подій"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        now = datetime.utcnow()
+        upcoming_events = Event.find_upcoming(user_id, minutes=30)
+        
+        return jsonify({
+            'current_time': now.isoformat(),
+            'current_date': now.date().isoformat(),
+            'upcoming_events': [event.to_dict() for event in upcoming_events],
+            'has_upcoming': len(upcoming_events) > 0
+        }), 200
+    except Exception as e:
+        return jsonify({'error': f'Помилка отримання календаря: {str(e)}'}), 500
+
+# >>>>>>>>>> СОБЫТИЯ >>>>>>>>>>
+
+@app.route('/api/events', methods=['GET', 'OPTIONS'])
+def get_events():
+    """Отримання всих подій користувача"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        events = Event.find_by_user(user_id)
+        return jsonify({
+            'events': [event.to_dict() for event in events],
+            'total': len(events)
+        }), 200
+    except Exception as e:
+        return jsonify({'error': f'Помилка отримання подій: {str(e)}'}), 500
+
+@app.route('/api/events', methods=['POST', 'OPTIONS'])
+def create_event():
+    """Створення нової події"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        data = request.get_json()
+        
+        # Обов'язкові поля
+        required_fields = ['title', 'start_time', 'end_time']
+        for field in required_fields:
+            if not data.get(field):
+                return jsonify({'error': f'Поле "{field}" є обов\'язковим'}), 400
+        
+        # Парсинг дат
+        try:
+            start_time = datetime.fromisoformat(data['start_time'].replace('Z', '+00:00'))
+            end_time = datetime.fromisoformat(data['end_time'].replace('Z', '+00:00'))
+        except:
+            return jsonify({'error': 'Невірний формат дати. Використовуйте ISO 8601'}), 400
+        
+        if start_time >= end_time:
+            return jsonify({'error': 'Час початку повинен бути раніше часу закінчення'}), 400
+        
+        event = Event.create(
+            user_id=user_id,
+            title=data['title'],
+            start_time=start_time,
+            end_time=end_time,
+            description=data.get('description'),
+            location=data.get('location')
+        )
+        
+        return jsonify({
+            'message': 'Подія створена',
+            'event': event.to_dict()
+        }), 201
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Помилка створення події: {str(e)}'}), 500
+
+@app.route('/api/events/<int:event_id>', methods=['GET', 'OPTIONS'])
+def get_event(event_id):
+    """Отримання конкретної події"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    event = Event.find_by_id(event_id)
+    if not event:
+        return jsonify({'error': 'Подію не знайдено'}), 404
+    
+    if event.user_id != user_id:
+        return jsonify({'error': 'Немає доступу до цієї події'}), 403
+    
+    return jsonify({'event': event.to_dict()}), 200
+
+@app.route('/api/events/<int:event_id>', methods=['PUT', 'OPTIONS'])
+def update_event(event_id):
+    """Оновлення події"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    event = Event.find_by_id(event_id)
+    if not event:
+        return jsonify({'error': 'Подію не знайдено'}), 404
+    
+    if event.user_id != user_id:
+        return jsonify({'error': 'Немає доступу до цієї події'}), 403
+    
+    try:
+        data = request.get_json()
+        updates = {}
+        
+        if 'title' in data:
+            updates['title'] = data['title']
+        
+        if 'description' in data:
+            updates['description'] = data['description']
+        
+        if 'location' in data:
+            updates['location'] = data['location']
+        
+        if 'reminder' in data:
+            updates['reminder'] = data['reminder']
+        
+        if 'is_completed' in data:
+            updates['is_completed'] = data['is_completed']
+        
+        if 'start_time' in data:
+            try:
+                updates['start_time'] = datetime.fromisoformat(data['start_time'].replace('Z', '+00:00'))
+            except:
+                return jsonify({'error': 'Невірний формат дати'}), 400
+        
+        if 'end_time' in data:
+            try:
+                updates['end_time'] = datetime.fromisoformat(data['end_time'].replace('Z', '+00:00'))
+            except:
+                return jsonify({'error': 'Невірний формат дати'}), 400
+        
+        updated_event = Event.update(event_id, **updates)
+        
+        return jsonify({
+            'message': 'Подія оновлена',
+            'event': updated_event.to_dict()
+        }), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Помилка оновлення: {str(e)}'}), 500
+
+@app.route('/api/events/<int:event_id>', methods=['DELETE', 'OPTIONS'])
+def delete_event(event_id):
+    """Видалення події"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    event = Event.find_by_id(event_id)
+    if not event:
+        return jsonify({'error': 'Подію не знайдено'}), 404
+    
+    if event.user_id != user_id:
+        return jsonify({'error': 'Немає доступу до цієї події'}), 403
+    
+    try:
+        Event.delete(event_id)
+        return jsonify({'message': 'Подія видалена'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
+
+@app.route('/api/events/upcoming/<int:minutes>', methods=['GET', 'OPTIONS'])
+def get_upcoming_events(minutes):
+    """Отримання близьких подій (з можливістю встановити кількість хвилин)"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        if minutes <= 0 or minutes > 1440:  # Макс 24 години
+            minutes = 30
+        
+        upcoming_events = Event.find_upcoming(user_id, minutes=minutes)
+        
+        return jsonify({
+            'events': [event.to_dict() for event in upcoming_events],
+            'total': len(upcoming_events),
+            'check_window_minutes': minutes
+        }), 200
+    except Exception as e:
+        return jsonify({'error': f'Помилка отримання подій: {str(e)}'}), 500
 
 # ==================== ОБРОБКА ПОМИЛОК ====================
 
