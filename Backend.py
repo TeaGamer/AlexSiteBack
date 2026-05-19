@@ -7,6 +7,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import threading
 from pytz import timezone
+import requests
+import json
 
 # ==================== ІНІЦІАЛІЗАЦІЯ ====================
 
@@ -234,6 +236,63 @@ class Event(db.Model):
             db.session.commit()
             return True
         return False
+
+# ==================== МОДЕЛЬ ЧАТУ ====================
+
+class ChatMessage(db.Model):
+    """Модель повідомлення чату"""
+    __tablename__ = 'chat_messages'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    message = db.Column(db.Text, nullable=False)  # Повідомлення користувача
+    response = db.Column(db.Text, nullable=True)  # Відповідь ШІ
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        """Конвертація повідомлення в словник"""
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'message': self.message,
+            'response': self.response,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+        }
+    
+    @staticmethod
+    def create(user_id, message, response=None):
+        """Створення нового повідомлення"""
+        chat_msg = ChatMessage(
+            user_id=user_id,
+            message=message,
+            response=response
+        )
+        db.session.add(chat_msg)
+        db.session.commit()
+        return chat_msg
+    
+    @staticmethod
+    def find_by_user(user_id, limit=50):
+        """Отримання історії чату користувача"""
+        return ChatMessage.query.filter_by(user_id=user_id).order_by(ChatMessage.created_at.desc()).limit(limit).all()[::-1]
+    
+    @staticmethod
+    def find_by_id(msg_id):
+        """Пошук повідомлення за ID"""
+        return ChatMessage.query.get(msg_id)
+    
+    @staticmethod
+    def update_response(msg_id, response):
+        """Оновлення відповіді ШІ"""
+        msg = ChatMessage.query.get(msg_id)
+        if msg:
+            msg.response = response
+            msg.updated_at = datetime.utcnow()
+            db.session.commit()
+            return msg
+        return None
 
 # ==================== JWT ТОКЕНИ ====================
 
@@ -685,6 +744,149 @@ def get_upcoming_events(minutes):
         }), 200
     except Exception as e:
         return jsonify({'error': f'Помилка отримання подій: {str(e)}'}), 500
+
+# ==================== ЧАТ З ШІ ====================
+
+def call_ai_api(message, chat_history=None):
+    """
+    Виклик AI API для отримання відповіді.
+    
+    Args:
+        message: Текст повідомлення від користувача
+        chat_history: Історія чату для контексту (опціонально)
+    
+    Returns:
+        Текст відповіді від ШІ або None при помилці
+    """
+    try:
+        ai_api_url = os.environ.get('AI_API_URL', 'http://localhost:8001/api/chat/stream')
+        
+        # Формуємо запит
+        payload = {
+            'message': message
+        }
+        
+        # Викликаємо AI API
+        response = requests.post(
+            ai_api_url,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            return response.text
+        else:
+            print(f"❌ AI API помилка: {response.status_code}")
+            return None
+    
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Помилка при виклику AI API: {str(e)}")
+        return None
+    except Exception as e:
+        print(f"❌ Невідома помилка: {str(e)}")
+        return None
+
+@app.route('/api/chat', methods=['POST', 'OPTIONS'])
+def chat_with_ai():
+    """Чат з ШІ з зберіганням історії"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        data = request.get_json()
+        
+        if not data.get('message') or not data['message'].strip():
+            return jsonify({'error': 'Повідомлення не може бути пустим'}), 400
+        
+        message = data['message'].strip()
+        
+        # Отримуємо історію чату для контексту
+        chat_history = ChatMessage.find_by_user(user_id, limit=10)
+        
+        # Зберігаємо повідомлення користувача
+        chat_msg = ChatMessage.create(user_id, message)
+        
+        # Викликаємо AI API
+        ai_response = call_ai_api(message, chat_history)
+        
+        if ai_response is None:
+            return jsonify({
+                'error': 'Не вдалося отримати відповідь від ШІ',
+                'message_id': chat_msg.id
+            }), 503
+        
+        # Оновлюємо відповідь у БД
+        ChatMessage.update_response(chat_msg.id, ai_response)
+        
+        return jsonify({
+            'message_id': chat_msg.id,
+            'user_message': message,
+            'ai_response': ai_response,
+            'timestamp': chat_msg.created_at.isoformat()
+        }), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Помилка чату: {str(e)}")
+        return jsonify({'error': f'Помилка чату: {str(e)}'}), 500
+
+@app.route('/api/chat/history', methods=['GET', 'OPTIONS'])
+def get_chat_history():
+    """Отримання історії чату користувача"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        limit = request.args.get('limit', default=50, type=int)
+        if limit > 100:
+            limit = 100
+        if limit < 1:
+            limit = 10
+        
+        chat_history = ChatMessage.find_by_user(user_id, limit=limit)
+        
+        return jsonify({
+            'messages': [msg.to_dict() for msg in chat_history],
+            'total': len(chat_history)
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': f'Помилка отримання історії: {str(e)}'}), 500
+
+@app.route('/api/chat/<int:msg_id>', methods=['DELETE', 'OPTIONS'])
+def delete_chat_message(msg_id):
+    """Видалення повідомлення з історії"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+    
+    try:
+        msg = ChatMessage.find_by_id(msg_id)
+        if not msg:
+            return jsonify({'error': 'Повідомлення не знайдено'}), 404
+        
+        if msg.user_id != user_id:
+            return jsonify({'error': 'Немає доступу до цього повідомлення'}), 403
+        
+        db.session.delete(msg)
+        db.session.commit()
+        
+        return jsonify({'message': 'Повідомлення видалено'}), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
 
 # ==================== ОБРОБКА ПОМИЛОК ====================
 
