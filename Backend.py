@@ -316,10 +316,23 @@ def get_current_user_id(request):
     """Отримання ID поточного користувача з токена"""
     auth_header = request.headers.get('Authorization', '')
     if not auth_header.startswith('Bearer '):
+        print(f"❌ Authorization header відсутній або невірний формат: {auth_header}")
         return None
     
-    token = auth_header.split(' ')[1]
-    return verify_token(token)
+    try:
+        parts = auth_header.split(' ')
+        if len(parts) < 2:
+            print(f"❌ Невірний формат Authorization header: {auth_header}")
+            return None
+        
+        token = parts[1]
+        user_id = verify_token(token)
+        if user_id is None:
+            print(f"❌ Невірний або закінчився токен")
+        return user_id
+    except Exception as e:
+        print(f"❌ Помилка при парсингу токена: {str(e)}")
+        return None
 
 # ==================== API МАРШРУТИ ====================
 
@@ -327,6 +340,30 @@ def get_current_user_id(request):
 def health_check():
     """Перевірка стану сервера"""
     return jsonify({'status': 'ok', 'message': 'Backend is running'}), 200
+
+@app.route('/api/verify-token', methods=['GET', 'POST', 'OPTIONS'])
+def verify_token_endpoint():
+    """Перевірка валідності токена (DEBUG)"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    user_id = get_current_user_id(request)
+    
+    auth_header = request.headers.get('Authorization', '')
+    
+    if user_id:
+        return jsonify({
+            'status': 'valid',
+            'user_id': user_id,
+            'message': 'Токен дійсний'
+        }), 200
+    else:
+        return jsonify({
+            'status': 'invalid',
+            'auth_header': auth_header[:20] + '...' if len(auth_header) > 20 else auth_header,
+            'message': 'Токен невірний або відсутній',
+            'hint': 'Переконайтеся, що Header містить: Authorization: Bearer <TOKEN>'
+        }), 401
 
 # >>>>>>>>>> РЕЄСТРАЦІЯ >>>>>>>>>>
 
@@ -794,7 +831,12 @@ def chat_with_ai():
     
     user_id = get_current_user_id(request)
     if not user_id:
-        return jsonify({'error': 'Не автентифіковано'}), 401
+        auth_header = request.headers.get('Authorization', '')
+        print(f"❌ Запит до /api/chat без валідного токена. Auth header: {auth_header[:30] if auth_header else 'відсутній'}...")
+        return jsonify({
+            'error': 'Не автентифіковано',
+            'message': 'Токен не знайдено або він невірний. Переконайтеся, що токен передано у форматі: Authorization: Bearer <TOKEN>'
+        }), 401
     
     try:
         data = request.get_json()
@@ -842,7 +884,10 @@ def get_chat_history():
     
     user_id = get_current_user_id(request)
     if not user_id:
-        return jsonify({'error': 'Не автентифіковано'}), 401
+        return jsonify({
+            'error': 'Не автентифіковано',
+            'message': 'Токен не знайдено або він невірний'
+        }), 401
     
     try:
         limit = request.args.get('limit', default=50, type=int)
