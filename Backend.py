@@ -2,9 +2,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 import os
+from fastapi import FastAPI, HTTPException
 import jwt
+from pydantic import BaseModel, Field
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
+from dateutil import parser as dtparser
 import threading
 from pytz import timezone
 import requests
@@ -13,6 +16,7 @@ import json
 # ==================== ІНІЦІАЛІЗАЦІЯ ====================
 
 app = Flask(__name__)
+
 
 # CORS налаштування
 cors_origins_env = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:10000,http://localhost:8000,https://alexsite-swzo.onrender.com')
@@ -39,6 +43,75 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-
 print(f"📍 Database URL: {DATABASE_URL}")
 
 db = SQLAlchemy(app)
+
+# Додати після імпортів у Backend.py (вже є requests, json, os — нічого нового не треба)
+
+@app.route('/api/chat/parse-event', methods=['POST', 'OPTIONS'])
+def parse_event_from_text():
+    """Парсинг події з тексту через AlexSite AI"""
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+
+    try:
+        data = request.get_json()
+        user_text = data.get('text', '').strip()
+        if not user_text:
+            return jsonify({'error': 'Текст порожній'}), 400
+
+        # Запит до AlexSite AI з чітким промптом
+        ai_api_url = os.environ.get('AI_API_URL', 'http://localhost:8001/api/chat')
+
+        prompt = f"""Parse this calendar event request and return ONLY valid JSON, no explanation:
+{{
+  "title": "short event title",
+  "date": "YYYY-MM-DD",
+  "time": "HH:MM or empty string",
+  "category": "one of: Lectures (lessons), Exams, Meetings, Notes, Events",
+  "is_event": true
+}}
+
+Today is {datetime.utcnow().strftime('%Y-%m-%d')}.
+User message: {user_text}"""
+
+        response = requests.post(
+            ai_api_url,
+            json={'message': prompt},
+            timeout=20
+        )
+
+        if response.status_code != 200:
+            return jsonify({'error': 'AI недоступний'}), 502
+
+        ai_text = response.json().get('response', '')
+
+        # Витягнути JSON з відповіді AI
+        import re
+        json_match = re.search(r'\{.*?\}', ai_text, re.DOTALL)
+        if not json_match:
+            return jsonify({'error': 'AI не повернув JSON', 'raw': ai_text}), 500
+
+        event_data = json.loads(json_match.group())
+
+        # Якщо AI вирішив що це не подія
+        if not event_data.get('is_event'):
+            return jsonify({'is_event': False}), 200
+
+        return jsonify({
+            'is_event': True,
+            'title': event_data.get('title', user_text[:50]),
+            'date': event_data.get('date', datetime.utcnow().strftime('%Y-%m-%d')),
+            'time': event_data.get('time', ''),
+            'category': event_data.get('category', 'Events')
+        }), 200
+
+    except json.JSONDecodeError:
+        return jsonify({'error': 'AI повернув невалідний JSON'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ==================== МОДЕЛІ ====================
 
@@ -587,6 +660,7 @@ def get_calendar_current():
         }), 200
     except Exception as e:
         return jsonify({'error': f'Помилка отримання календаря: {str(e)}'}), 500
+
 
 # >>>>>>>>>> СОБЫТИЯ >>>>>>>>>>
 
