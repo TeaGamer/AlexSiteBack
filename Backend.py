@@ -2,12 +2,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 import os
-from fastapi import FastAPI, HTTPException
 import jwt
-from pydantic import BaseModel, Field
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
-from dateutil import parser as dtparser
 import threading
 from pytz import timezone
 import requests
