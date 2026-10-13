@@ -32,7 +32,6 @@ MAX_TOTAL_EXTRACTED_TEXT_LENGTH = 60_000
 app.config['MAX_CONTENT_LENGTH'] = MAX_TOTAL_UPLOAD_SIZE + 1024 * 1024
 
 
-# CORS налаштування
 cors_origins_env = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:10000,http://localhost:8000,https://alexsite-swzo.onrender.com')
 cors_origins = [origin.strip() for origin in cors_origins_env.split(',')]
 
