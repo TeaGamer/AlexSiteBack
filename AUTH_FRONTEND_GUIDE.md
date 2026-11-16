@@ -61,7 +61,6 @@ export default authService;
 ```
 
 ### 1️⃣ Після входу користувача (Login)
-
 Після успішного входу, бекенд повертає:
 
 ```json
@@ -106,7 +105,6 @@ if (data.token) {
 ```
 
 ### 2️⃣ Відправлення запиту до ШІ (Chat)
-
 Коли відправляєте запит до чату, **ОБОВ'ЯЗКОВО** включіть токен у заголовок `Authorization`:
 
 **TypeScript версія:**
@@ -146,9 +144,7 @@ if (!response.ok) {
 ```
 
 ### 3️⃣ Формат заголовка Authorization
-
 Заголовок **ПОВИНЕН** мати точний формат:
-
 ```
 Authorization: Bearer YOUR_TOKEN_HERE
 ```
@@ -163,7 +159,6 @@ Authorization: Bearer YOUR_TOKEN_HERE
 - `Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`
 
 ### 4️⃣ Перевірка токена (DEBUG)
-
 Щоб перевірити, чи токен відправляється правильно, зробіть запит до:
 
 ```bash
@@ -193,7 +188,6 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 ### 5️⃣ Повна функція для чату
 
 **TypeScript версія:**
-
 ```typescript
 interface ChatMessage {
   message_id: number;
@@ -385,7 +379,6 @@ try {
 ```
 
 ## Контрольний список
-
 - [ ] Токен зберігається в `localStorage` після входу
 - [ ] При запиті до ШІ токен відправляється в заголовку `Authorization: Bearer TOKEN`
 - [ ] Формат заголовка точно відповідає `Bearer ` (з пробілом після Bearer)
@@ -393,7 +386,6 @@ try {
 - [ ] Токен оновлюється при кожному новому входу
 
 ## 📦 Альтернатива: Использование Axios
-
 Якщо ви використовуєте **Axios** (часто простіше за Fetch):
 
 **TypeScript версія:**
@@ -451,7 +443,6 @@ yarn add axios
 ```
 
 ## Ще потрібна допомога?
-
 Запустіть бекенд з дебаг-логуванням та перевірте консоль:
 
 ```bash
