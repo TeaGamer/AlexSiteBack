@@ -1,25 +1,23 @@
 # Конфігурація для Backend
 
 import os
-from datetime import timedelta
 
 class Config:
     """Базова конфігурація"""
     
     # База даних
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or \
-        f'sqlite:///{os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "DataBase", "users.db"))}'
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///users.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     
     # Безпека
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'local-development-key-change-before-deploy'
     
     # JWT
-    JWT_EXPIRATION_HOURS = 24 * 30  # 30 днів
+    JWT_EXPIRATION_HOURS = int(os.environ.get('JWT_EXPIRATION_HOURS', '720'))
     
     # Сервер
     HOST = '0.0.0.0'
-    PORT = 5000
+    PORT = 8000
     DEBUG = True
 
 
@@ -33,13 +31,14 @@ class ProductionConfig(Config):
     """Конфігурація для production"""
     DEBUG = False
     TESTING = False
-    SECRET_KEY = os.environ.get('SECRET_KEY')  # Обов'язково встановіти
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL')  # Обов'язково встановіти
+    SECRET_KEY = os.environ.get('SECRET_KEY')
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL')
 
 
 class TestingConfig(Config):
     """Конфігурація для тестування"""
     TESTING = True
+    DEBUG = False
     SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
 
 

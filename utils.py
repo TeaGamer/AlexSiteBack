@@ -3,8 +3,14 @@
 import logging
 from functools import wraps
 from flask import request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
 import os
+
+
+def utcnow():
+    """Return a naive UTC timestamp for compatibility with existing responses."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 # ==================== ЛОГУВАННЯ ====================
 
@@ -50,9 +56,9 @@ def validate_json(*required_fields):
             if not request.is_json:
                 return jsonify({'error': 'Content-Type має бути application/json'}), 400
             
-            data = request.get_json()
-            if data is None:
-                return jsonify({'error': 'Порожне тіло запиту'}), 400
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({'error': 'Тіло запиту має бути JSON-об’єктом'}), 400
             
             for field in required_fields:
                 if field not in data or not data[field]:
@@ -115,7 +121,7 @@ def success_response(data, message='Success', status_code=200):
         'status': 'success',
         'message': message,
         'data': data,
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': utcnow().isoformat()
     }), status_code
 
 
@@ -124,7 +130,7 @@ def error_response(error, status_code=400):
     return jsonify({
         'status': 'error',
         'error': error,
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': utcnow().isoformat()
     }), status_code
 
 

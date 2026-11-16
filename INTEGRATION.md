@@ -6,20 +6,18 @@
 
 ## 🔧 Налаштування CORS
 
-Бекенд вже налаштований для CORS, тому фронтенд може робити запити з `localhost:3000`.
+Бекенд дозволяє джерела зі змінної середовища `CORS_ORIGINS`. За замовчуванням
+дозволено локальний фронтенд на `http://localhost:3000` і налаштований production-домен.
 
 ### Якщо виникають CORS помилки:
 
-Переконайтесь, що в Backend.py код містить:
-```python
-from flask_cors import CORS
-CORS(app, resources={"*": {"origins": "*"}})
+Додайте точний origin фронтенду у `.env` (без кінцевого `/`), наприклад:
+```bash
+CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
 ```
 
-Для production обмежте дозволені походження:
-```python
-CORS(app, resources={"*": {"origins": ["https://yourdomain.com"]}})
-```
+У production `CORS_ORIGINS` за замовчуванням дозволяє лише `https://alexsite-swzo.onrender.com`;
+замініть його на фактичні frontend-origin. Не використовуйте wildcard origin у production.
 
 ## 🌍 URL Бекенду
 

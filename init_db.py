@@ -2,29 +2,23 @@
 
 import os
 import sys
-from datetime import datetime
-from werkzeug.security import generate_password_hash
 
 # Додаємо шлях до Backend.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from Backend import app, User, init_db
+from Backend import app, db, User, Event, ChatMessage
+
+
+def init_db():
+    """Створення таблиць бази даних"""
+    with app.app_context():
+        db.create_all()
 
 
 def seed_database():
     """Додавання тестових даних"""
     print("🗑️  Видалення старих даних...")
-    
-    # Очистимо таблицю
-    import sqlite3
-    db = sqlite3.connect(app.config['DATABASE'])
-    cursor = db.cursor()
-    cursor.execute('DELETE FROM users')
-    db.commit()
-    db.close()
-    
-    print("✓ Таблиця очищена")
-    
+
     # Тестові користувачі
     test_users = [
         {
@@ -64,11 +58,22 @@ def seed_database():
             'region': 'Odesa, Ukraine'
         },
     ]
-    
-    for user_data in test_users:
-        user = User.create(**user_data)
-        print(f"✓ Додано користувача: {user['login']}")
-    
+
+    with app.app_context():
+        try:
+            db.session.query(ChatMessage).delete()
+            db.session.query(Event).delete()
+            db.session.query(User).delete()
+            db.session.commit()
+
+            print("✓ Таблиці очищені")
+            for user_data in test_users:
+                user = User.create(**user_data)
+                print(f"✓ Додано користувача: {user.login}")
+        except Exception:
+            db.session.rollback()
+            raise
+
     print(f"\n✅ Додано {len(test_users)} тестових користувачів")
 
 
@@ -78,49 +83,50 @@ def drop_database():
     response = input("Ви впевнені? (yes/no): ").strip().lower()
     
     if response == 'yes':
-        import sqlite3
-        db = sqlite3.connect(app.config['DATABASE'])
-        cursor = db.cursor()
-        cursor.execute('DROP TABLE IF EXISTS users')
-        db.commit()
-        db.close()
-        print("✓ Все таблиці видалені")
+        with app.app_context():
+            db.drop_all()
+            print("✓ Всі таблиці видалені")
     else:
         print("❌ Операція скасована")
 
 
 def list_users():
     """Вивід списку всіх користувачів"""
-    users = User.get_all()
-    
-    if not users:
-        print("❌ Немає користувачів у базі даних")
-        return
-    
-    print("\n" + "="*80)
-    print(f"{'ID':<5} {'Login':<20} {'Email':<30} {'Ім\'я':<15} {'Регіон':<15}")
-    print("="*80)
-    
-    for user in users:
-        full_name = f"{user['first_name']} {user['last_name']}"
-        print(f"{user['id']:<5} {user['login']:<20} {user['email']:<30} {full_name:<15} {user['region'] or 'N/A':<15}")
-    
-    print("="*80)
-    print(f"Всього: {len(users)} користувачів\n")
+    with app.app_context():
+        users = User.get_all()
+
+        if not users:
+            print("❌ Немає користувачів у базі даних")
+            return
+
+        print("\n" + "="*80)
+        print(f"{'ID':<5} {'Login':<20} {'Email':<30} {'Ім\'я':<15} {'Регіон':<15}")
+        print("="*80)
+
+        for user in users:
+            full_name = f"{user.first_name} {user.last_name}"
+            print(
+                f"{user.id:<5} {user.login:<20} {user.email:<30} "
+                f"{full_name:<15} {user.region or 'N/A':<15}"
+            )
+
+        print("="*80)
+        print(f"Всього: {len(users)} користувачів\n")
 
 
 def get_user_stats():
     """Статистика користувачів"""
-    users = User.get_all()
-    
-    print("\n📊 Статистика Бази Даних")
-    print(f"Всього користувачів: {len(users)}")
-    
-    if len(users) > 0:
-        # Сортуємо за created_at
-        sorted_users = sorted(users, key=lambda x: x['created_at'])
-        oldest_user = sorted_users[0]
-        newest_user = sorted_users[-1]
+    with app.app_context():
+        users = User.get_all()
+
+        print("\n📊 Статистика Бази Даних")
+        print(f"Всього користувачів: {len(users)}")
+
+        if users:
+            oldest_user = min(users, key=lambda user: user.created_at)
+            newest_user = max(users, key=lambda user: user.created_at)
+            print(f"Найстаріший обліковий запис: {oldest_user.login} ({oldest_user.created_at})")
+            print(f"Найновіший обліковий запис: {newest_user.login} ({newest_user.created_at})")
         
 def main():
     """Головна функція"""

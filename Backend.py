@@ -3,16 +3,15 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 load_dotenv()
-from models import db, User
+from config import config as app_configs
 import os
 import jwt
 import re
 import io
+import logging
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from datetime import datetime, timedelta
-import threading
-from pytz import timezone
+from datetime import datetime, timedelta, timezone
 import requests
 import json
 import zipfile
@@ -24,6 +23,24 @@ from pypdf.errors import PdfReadError, PdfStreamError
 # ==================== ІНІЦІАЛІЗАЦІЯ ====================
 
 app = Flask(__name__)
+environment = os.environ.get('FLASK_ENV', 'development').lower()
+if environment not in app_configs:
+    raise RuntimeError(f'Unsupported FLASK_ENV value: {environment}')
+app_config = app_configs[environment]
+app.config.from_object(app_config)
+
+if environment == 'production':
+    secret_key = app.config.get('SECRET_KEY')
+    if not secret_key or not secret_key.strip() or len(secret_key) < 32 or secret_key in {
+        'local-development-key-change-before-deploy',
+        'your-super-secret-key-change-this-in-production',
+    }:
+        raise RuntimeError('Set a unique SECRET_KEY of at least 32 characters in production.')
+    if not app.config.get('SQLALCHEMY_DATABASE_URI'):
+        raise RuntimeError('DATABASE_URL must be configured in production.')
+if app.config['JWT_EXPIRATION_HOURS'] <= 0:
+    raise RuntimeError('JWT_EXPIRATION_HOURS must be greater than zero.')
+
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024
 MAX_TOTAL_UPLOAD_SIZE = 20 * 1024 * 1024
 MAX_UPLOAD_COUNT = 5
@@ -32,8 +49,18 @@ MAX_TOTAL_EXTRACTED_TEXT_LENGTH = 60_000
 app.config['MAX_CONTENT_LENGTH'] = MAX_TOTAL_UPLOAD_SIZE + 1024 * 1024
 
 
-cors_origins_env = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:10000,http://localhost:8000,https://alexsite-swzo.onrender.com')
-cors_origins = [origin.strip() for origin in cors_origins_env.split(',')]
+default_cors_origins = (
+    'https://alexsite-swzo.onrender.com'
+    if environment == 'production'
+    else 'http://localhost:3000,http://localhost:10000,http://localhost:8000,https://alexsite-swzo.onrender.com'
+)
+cors_origins_env = os.environ.get('CORS_ORIGINS', default_cors_origins)
+cors_origins = [origin.strip() for origin in cors_origins_env.split(',') if origin.strip()]
+if environment == 'production':
+    if not cors_origins:
+        raise RuntimeError('CORS_ORIGINS must include at least one production origin.')
+    if '*' in cors_origins:
+        raise RuntimeError('CORS_ORIGINS must not contain a wildcard in production.')
 
 print(f"✅ CORS дозволені джерела: {cors_origins}")
 
@@ -45,19 +72,37 @@ CORS(app,
 )
 
 # Конфігурація БД
-DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///users.db')
+DATABASE_URL = app.config['SQLALCHEMY_DATABASE_URI']
+if not DATABASE_URL:
+    raise RuntimeError('DATABASE_URL must not be empty.')
 # Конвертація postgresql:// в postgresql+psycopg:// для psycopg3
 if DATABASE_URL.startswith('postgresql://'):
     DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+psycopg://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
-
-print(f"📍 Database URL: {DATABASE_URL}")
+app.logger.setLevel(logging.INFO)
 
 db = SQLAlchemy(app)
 
-# Додати після імпортів у Backend.py (вже є requests, json, os — нічого нового не треба)
+
+def utcnow():
+    """UTC timestamp kept naive for compatibility with existing database columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def get_json_object():
+    """Return a JSON object request body, or None for invalid/non-object JSON."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+def parse_iso_datetime(value):
+    """Parse an ISO-8601 datetime and normalize it to naive UTC."""
+    if not isinstance(value, str):
+        raise ValueError('Datetime must be a string.')
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 @app.route('/api/chat/parse-event', methods=['POST', 'OPTIONS'])
 def parse_event_from_text():
@@ -70,8 +115,10 @@ def parse_event_from_text():
         return jsonify({'error': 'Не автентифіковано'}), 401
 
     try:
-        data = request.get_json()
-        user_text = data.get('text', '').strip()
+        data = get_json_object()
+        if data is None or not isinstance(data.get('text'), str):
+            return jsonify({'error': 'Надішліть JSON-об’єкт із текстовим полем text.'}), 400
+        user_text = data['text'].strip()
         if not user_text:
             return jsonify({'error': 'Текст порожній'}), 400
 
@@ -87,7 +134,7 @@ def parse_event_from_text():
   "is_event": true
 }}
 
-Today is {datetime.utcnow().strftime('%Y-%m-%d')}.
+Today is {utcnow().strftime('%Y-%m-%d')}.
 User message: {user_text}"""
 
         response = requests.post(
@@ -99,13 +146,16 @@ User message: {user_text}"""
         if response.status_code != 200:
             return jsonify({'error': 'AI недоступний'}), 502
 
-        ai_text = response.json().get('response', '')
+        ai_result = response.json()
+        if not isinstance(ai_result, dict) or not isinstance(ai_result.get('response'), str):
+            return jsonify({'error': 'AI повернув некоректну відповідь'}), 502
+        ai_text = ai_result['response']
 
         # Витягнути JSON з відповіді AI
         import re
         json_match = re.search(r'\{.*?\}', ai_text, re.DOTALL)
         if not json_match:
-            return jsonify({'error': 'AI не повернув JSON', 'raw': ai_text}), 500
+            return jsonify({'error': 'AI не повернув JSON'}), 502
 
         event_data = json.loads(json_match.group())
 
@@ -113,18 +163,31 @@ User message: {user_text}"""
         if not event_data.get('is_event'):
             return jsonify({'is_event': False}), 200
 
+        title = event_data.get('title', user_text[:50])
+        event_date = event_data.get('date', utcnow().strftime('%Y-%m-%d'))
+        event_time = event_data.get('time', '')
+        category = event_data.get('category', 'Events')
+        if not all(isinstance(value, str) for value in (title, event_date, event_time, category)):
+            return jsonify({'error': 'AI повернув некоректні поля події'}), 502
+
         return jsonify({
             'is_event': True,
-            'title': event_data.get('title', user_text[:50]),
-            'date': event_data.get('date', datetime.utcnow().strftime('%Y-%m-%d')),
-            'time': event_data.get('time', ''),
-            'category': event_data.get('category', 'Events')
+            'title': title,
+            'date': event_date,
+            'time': event_time,
+            'category': category
         }), 200
 
     except json.JSONDecodeError:
-        return jsonify({'error': 'AI повернув невалідний JSON'}), 500
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'AI повернув невалідний JSON'}), 502
+    except requests.exceptions.RequestException:
+        app.logger.exception('AI event parser request failed')
+        return jsonify({'error': 'AI недоступний'}), 502
+    except (TypeError, AttributeError):
+        return jsonify({'error': 'AI повернув некоректну відповідь'}), 502
+    except Exception:
+        app.logger.exception('Event parsing failed')
+        return jsonify({'error': 'Не вдалося обробити запит події'}), 500
 
 # ==================== МОДЕЛІ ====================
 
@@ -141,8 +204,10 @@ class User(db.Model):
     date_of_birth = db.Column(db.String(20))
     region = db.Column(db.String(120), default='Ukraine')
     is_active = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
+    events = db.relationship('Event', back_populates='user', cascade='all, delete-orphan')
+    chat_messages = db.relationship('ChatMessage', back_populates='user', cascade='all, delete-orphan')
     
     @staticmethod
     def find_by_login(login):
@@ -188,7 +253,7 @@ class User(db.Model):
             if key in allowed_fields and value is not None:
                 setattr(user, key, value)
         
-        user.updated_at = datetime.utcnow()
+        user.updated_at = utcnow()
         db.session.commit()
         return user
     
@@ -234,6 +299,7 @@ class Event(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user = db.relationship('User', back_populates='events')
     title = db.Column(db.String(255), nullable=False)
     description = db.Column(db.Text, nullable=True)
     start_time = db.Column(db.DateTime, nullable=False)
@@ -241,8 +307,8 @@ class Event(db.Model):
     location = db.Column(db.String(255), nullable=True)
     reminder = db.Column(db.Boolean, default=True)  # Чи показувати нагадування
     is_completed = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     
     def to_dict(self):
         """Конвертація події в словник"""
@@ -288,7 +354,7 @@ class Event(db.Model):
     @staticmethod
     def find_upcoming(user_id, minutes=30):
         """Пошук близьких подій (за замовчуванням на 30 хв)"""
-        now = datetime.utcnow()
+        now = utcnow()
         future = now + timedelta(minutes=minutes)
         return Event.query.filter(
             Event.user_id == user_id,
@@ -309,7 +375,7 @@ class Event(db.Model):
             if key in allowed_fields and value is not None:
                 setattr(event, key, value)
         
-        event.updated_at = datetime.utcnow()
+        event.updated_at = utcnow()
         db.session.commit()
         return event
     
@@ -331,10 +397,11 @@ class ChatMessage(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user = db.relationship('User', back_populates='chat_messages')
     message = db.Column(db.Text, nullable=False)  # Повідомлення користувача
     response = db.Column(db.Text, nullable=True)  # Відповідь ШІ
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     
     def to_dict(self):
         """Конвертація повідомлення в словник"""
@@ -375,7 +442,7 @@ class ChatMessage(db.Model):
         msg = ChatMessage.query.get(msg_id)
         if msg:
             msg.response = response
-            msg.updated_at = datetime.utcnow()
+            msg.updated_at = utcnow()
             db.session.commit()
             return msg
         return None
@@ -386,7 +453,7 @@ def generate_token(user_id):
     """Генерування JWT токена"""
     payload = {
         'user_id': user_id,
-        'exp': datetime.utcnow() + timedelta(days=30)
+        'exp': utcnow() + timedelta(hours=app.config['JWT_EXPIRATION_HOURS'])
     }
     return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
 
@@ -395,30 +462,15 @@ def verify_token(token):
     try:
         payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
         return payload['user_id']
-    except:
+    except (jwt.InvalidTokenError, KeyError, TypeError):
         return None
 
 def get_current_user_id(request):
     """Отримання ID поточного користувача з токена"""
-    auth_header = request.headers.get('Authorization', '')
-    if not auth_header.startswith('Bearer '):
-        print(f"❌ Authorization header відсутній або невірний формат: {auth_header}")
+    scheme, separator, token = request.headers.get('Authorization', '').partition(' ')
+    if scheme != 'Bearer' or not separator or not token.strip():
         return None
-    
-    try:
-        parts = auth_header.split(' ')
-        if len(parts) < 2:
-            print(f"❌ Невірний формат Authorization header: {auth_header}")
-            return None
-        
-        token = parts[1]
-        user_id = verify_token(token)
-        if user_id is None:
-            print(f"❌ Невірний або закінчився токен")
-        return user_id
-    except Exception as e:
-        print(f"❌ Помилка при парсингу токена: {str(e)}")
-        return None
+    return verify_token(token.strip())
 
 # ==================== API МАРШРУТИ ====================
 
@@ -435,8 +487,6 @@ def verify_token_endpoint():
     
     user_id = get_current_user_id(request)
     
-    auth_header = request.headers.get('Authorization', '')
-    
     if user_id:
         return jsonify({
             'status': 'valid',
@@ -446,7 +496,6 @@ def verify_token_endpoint():
     else:
         return jsonify({
             'status': 'invalid',
-            'auth_header': auth_header[:20] + '...' if len(auth_header) > 20 else auth_header,
             'message': 'Токен невірний або відсутній',
             'hint': 'Переконайтеся, що Header містить: Authorization: Bearer <TOKEN>'
         }), 401
@@ -502,6 +551,11 @@ def register():
             return jsonify({'error': 'Логін не може бути порожнім'}), 400
         if not first_name:
             return jsonify({'error': 'Ім’я не може бути порожнім'}), 400
+        if any(
+            field in data and data[field] is not None and not isinstance(data[field], str)
+            for field in ('date_of_birth', 'region')
+        ):
+            return jsonify({'error': 'Дата народження та регіон мають бути текстом.'}), 400
 
         if User.find_by_login(login):
             return jsonify({'error': 'Користувач з таким логіном вже існує'}), 409
@@ -527,9 +581,10 @@ def register():
             'token': token
         }), 201
     
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка реєстрації: {str(e)}'}), 500
+        app.logger.exception('Registration failed')
+        return jsonify({'error': 'Помилка реєстрації'}), 500
 
 # >>>>>>>>>> ВХІД >>>>>>>>>>
 
@@ -540,17 +595,21 @@ def login():
         return '', 200
     
     try:
-        data = request.get_json()
+        data = get_json_object()
+        if data is None:
+            return jsonify({'error': 'Надішліть коректний JSON-об’єкт.'}), 400
         
         if not data.get('login') or not data.get('password'):
             return jsonify({'error': 'Логін та пароль обов\'язкові'}), 400
+        if not isinstance(data['login'], str) or not isinstance(data['password'], str):
+            return jsonify({'error': 'Логін і пароль мають бути текстом.'}), 400
         
         # Спочатку шукаємо по login, потім по email
         user = User.find_by_login(data['login'])
         if not user:
             user = User.find_by_email(data['login'])
         
-        if not user or not check_password_hash(user.password_hash, data['password']):
+        if not user or not user.is_active or not check_password_hash(user.password_hash, data['password']):
             return jsonify({'error': 'Невірні облікові дані'}), 401
         
         token = generate_token(user.id)
@@ -561,8 +620,9 @@ def login():
             'token': token
         }), 200
     
-    except Exception as e:
-        return jsonify({'error': f'Помилка входу: {str(e)}'}), 500
+    except Exception:
+        app.logger.exception('Login failed')
+        return jsonify({'error': 'Помилка входу'}), 500
 
 # >>>>>>>>>> ПРОФІЛЬ >>>>>>>>>>
 
@@ -597,31 +657,49 @@ def update_profile():
         if not user:
             return jsonify({'error': 'Користувача не знайдено'}), 404
         
-        data = request.get_json()
+        data = get_json_object()
+        if data is None:
+            return jsonify({'error': 'Надішліть коректний JSON-об’єкт.'}), 400
         updates = {}
         
+        for field in ('email', 'first_name', 'last_name', 'region', 'date_of_birth'):
+            nullable = field in ('region', 'date_of_birth')
+            if field in data and (
+                (data[field] is None and not nullable)
+                or (data[field] is not None and not isinstance(data[field], str))
+            ):
+                return jsonify({'error': f'Поле "{field}" має бути текстом.'}), 400
+
         if 'email' in data:
+            data['email'] = data['email'].strip().lower()
+            if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', data['email']):
+                return jsonify({'error': 'Введіть коректну email-адресу'}), 400
             existing = User.find_by_email(data['email'])
             if existing and existing.id != user_id:
                 return jsonify({'error': 'Цей email вже використовується'}), 409
             updates['email'] = data['email']
-        
+
         if 'first_name' in data:
-            updates['first_name'] = data['first_name']
-        
+            updates['first_name'] = data['first_name'].strip()
+            if not updates['first_name']:
+                return jsonify({'error': 'Ім’я не може бути порожнім.'}), 400
+
         if 'last_name' in data:
-            updates['last_name'] = data['last_name']
-        
+            updates['last_name'] = data['last_name'].strip()
+
         if 'region' in data:
             updates['region'] = data['region']
-        
+
         if 'date_of_birth' in data:
             updates['date_of_birth'] = data['date_of_birth']
-        
-        if 'password' in data and data['password']:
-            if len(data['password']) < 6:
+
+        if 'password' in data and data['password'] is not None:
+            if not isinstance(data['password'], str):
+                return jsonify({'error': 'Пароль має бути текстом.'}), 400
+            if data['password'] and len(data['password']) < 6:
                 return jsonify({'error': 'Пароль повинен мати мінімум 6 символів'}), 400
-            updates['password_hash'] = generate_password_hash(data['password'])
+            if data['password']:
+                updates['password_hash'] = generate_password_hash(data['password'])
         
         updated_user = User.update(user_id, **updates)
         
@@ -630,9 +708,10 @@ def update_profile():
             'user': updated_user.to_dict()
         }), 200
     
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка оновлення: {str(e)}'}), 500
+        app.logger.exception('Profile update failed')
+        return jsonify({'error': 'Помилка оновлення профілю'}), 500
 
 # >>>>>>>>>> КОРИСТУВАЧІ >>>>>>>>>>
 
@@ -648,8 +727,9 @@ def get_users():
             'users': [user.to_dict(include_email=False) for user in users],
             'total': len(users)
         }), 200
-    except Exception as e:
-        return jsonify({'error': f'Помилка отримання користувачів: {str(e)}'}), 500
+    except Exception:
+        app.logger.exception('User listing failed')
+        return jsonify({'error': 'Помилка отримання користувачів'}), 500
 
 @app.route('/api/users/<int:user_id>', methods=['GET', 'OPTIONS'])
 def get_user(user_id):
@@ -676,11 +756,13 @@ def delete_account():
         return jsonify({'error': 'Не автентифіковано'}), 401
     
     try:
-        User.delete(user_id)
+        if not User.delete(user_id):
+            return jsonify({'error': 'Користувача не знайдено'}), 404
         return jsonify({'message': 'Обліковий запис видалено'}), 200
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
+        app.logger.exception('Account deletion failed')
+        return jsonify({'error': 'Помилка видалення облікового запису'}), 500
 
 # ==================== КАЛЕНДАР / ПОДІЇ ====================
 
@@ -695,7 +777,7 @@ def get_calendar_current():
         return jsonify({'error': 'Не автентифіковано'}), 401
     
     try:
-        now = datetime.utcnow()
+        now = utcnow()
         upcoming_events = Event.find_upcoming(user_id, minutes=30)
         
         return jsonify({
@@ -704,8 +786,9 @@ def get_calendar_current():
             'upcoming_events': [event.to_dict() for event in upcoming_events],
             'has_upcoming': len(upcoming_events) > 0
         }), 200
-    except Exception as e:
-        return jsonify({'error': f'Помилка отримання календаря: {str(e)}'}), 500
+    except Exception:
+        app.logger.exception('Calendar retrieval failed')
+        return jsonify({'error': 'Помилка отримання календаря'}), 500
 
 
 # >>>>>>>>>> СОБЫТИЯ >>>>>>>>>>
@@ -726,8 +809,9 @@ def get_events():
             'events': [event.to_dict() for event in events],
             'total': len(events)
         }), 200
-    except Exception as e:
-        return jsonify({'error': f'Помилка отримання подій: {str(e)}'}), 500
+    except Exception:
+        app.logger.exception('Event listing failed')
+        return jsonify({'error': 'Помилка отримання подій'}), 500
 
 @app.route('/api/events', methods=['POST', 'OPTIONS'])
 def create_event():
@@ -740,19 +824,28 @@ def create_event():
         return jsonify({'error': 'Не автентифіковано'}), 401
     
     try:
-        data = request.get_json()
+        data = get_json_object()
+        if data is None:
+            return jsonify({'error': 'Надішліть коректний JSON-об’єкт.'}), 400
         
         # Обов'язкові поля
         required_fields = ['title', 'start_time', 'end_time']
         for field in required_fields:
             if not data.get(field):
                 return jsonify({'error': f'Поле "{field}" є обов\'язковим'}), 400
+        if not isinstance(data['title'], str) or not data['title'].strip():
+            return jsonify({'error': 'Назва події має бути непорожнім текстом.'}), 400
+        if any(
+            field in data and data[field] is not None and not isinstance(data[field], str)
+            for field in ('description', 'location')
+        ):
+            return jsonify({'error': 'Опис і місце події мають бути текстом.'}), 400
         
         # Парсинг дат
         try:
-            start_time = datetime.fromisoformat(data['start_time'].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(data['end_time'].replace('Z', '+00:00'))
-        except:
+            start_time = parse_iso_datetime(data['start_time'])
+            end_time = parse_iso_datetime(data['end_time'])
+        except (TypeError, ValueError):
             return jsonify({'error': 'Невірний формат дати. Використовуйте ISO 8601'}), 400
         
         if start_time >= end_time:
@@ -760,7 +853,7 @@ def create_event():
         
         event = Event.create(
             user_id=user_id,
-            title=data['title'],
+            title=data['title'].strip(),
             start_time=start_time,
             end_time=end_time,
             description=data.get('description'),
@@ -772,9 +865,10 @@ def create_event():
             'event': event.to_dict()
         }), 201
     
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка створення події: {str(e)}'}), 500
+        app.logger.exception('Event creation failed')
+        return jsonify({'error': 'Помилка створення події'}), 500
 
 @app.route('/api/events/<int:event_id>', methods=['GET', 'OPTIONS'])
 def get_event(event_id):
@@ -813,35 +907,52 @@ def update_event(event_id):
         return jsonify({'error': 'Немає доступу до цієї події'}), 403
     
     try:
-        data = request.get_json()
+        data = get_json_object()
+        if data is None:
+            return jsonify({'error': 'Надішліть коректний JSON-об’єкт.'}), 400
         updates = {}
         
         if 'title' in data:
-            updates['title'] = data['title']
+            if not isinstance(data['title'], str) or not data['title'].strip():
+                return jsonify({'error': 'Назва події має бути непорожнім текстом.'}), 400
+            updates['title'] = data['title'].strip()
         
         if 'description' in data:
+            if data['description'] is not None and not isinstance(data['description'], str):
+                return jsonify({'error': 'Опис події має бути текстом.'}), 400
             updates['description'] = data['description']
         
         if 'location' in data:
+            if data['location'] is not None and not isinstance(data['location'], str):
+                return jsonify({'error': 'Місце події має бути текстом.'}), 400
             updates['location'] = data['location']
         
         if 'reminder' in data:
+            if not isinstance(data['reminder'], bool):
+                return jsonify({'error': 'Нагадування має бути логічним значенням.'}), 400
             updates['reminder'] = data['reminder']
         
         if 'is_completed' in data:
+            if not isinstance(data['is_completed'], bool):
+                return jsonify({'error': 'Статус події має бути логічним значенням.'}), 400
             updates['is_completed'] = data['is_completed']
         
         if 'start_time' in data:
             try:
-                updates['start_time'] = datetime.fromisoformat(data['start_time'].replace('Z', '+00:00'))
-            except:
+                updates['start_time'] = parse_iso_datetime(data['start_time'])
+            except (TypeError, ValueError):
                 return jsonify({'error': 'Невірний формат дати'}), 400
         
         if 'end_time' in data:
             try:
-                updates['end_time'] = datetime.fromisoformat(data['end_time'].replace('Z', '+00:00'))
-            except:
+                updates['end_time'] = parse_iso_datetime(data['end_time'])
+            except (TypeError, ValueError):
                 return jsonify({'error': 'Невірний формат дати'}), 400
+
+        start_time = updates.get('start_time', event.start_time)
+        end_time = updates.get('end_time', event.end_time)
+        if start_time >= end_time:
+            return jsonify({'error': 'Час початку повинен бути раніше часу закінчення'}), 400
         
         updated_event = Event.update(event_id, **updates)
         
@@ -850,9 +961,10 @@ def update_event(event_id):
             'event': updated_event.to_dict()
         }), 200
     
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка оновлення: {str(e)}'}), 500
+        app.logger.exception('Event update failed')
+        return jsonify({'error': 'Помилка оновлення події'}), 500
 
 @app.route('/api/events/<int:event_id>', methods=['DELETE', 'OPTIONS'])
 def delete_event(event_id):
@@ -874,9 +986,10 @@ def delete_event(event_id):
     try:
         Event.delete(event_id)
         return jsonify({'message': 'Подія видалена'}), 200
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
+        app.logger.exception('Event deletion failed')
+        return jsonify({'error': 'Помилка видалення події'}), 500
 
 @app.route('/api/events/upcoming/<int:minutes>', methods=['GET', 'OPTIONS'])
 def get_upcoming_events(minutes):
@@ -899,8 +1012,9 @@ def get_upcoming_events(minutes):
             'total': len(upcoming_events),
             'check_window_minutes': minutes
         }), 200
-    except Exception as e:
-        return jsonify({'error': f'Помилка отримання подій: {str(e)}'}), 500
+    except Exception:
+        app.logger.exception('Upcoming event retrieval failed')
+        return jsonify({'error': 'Помилка отримання подій'}), 500
 
 # ==================== ЧАТ З ШІ ====================
 
@@ -1017,12 +1131,22 @@ def call_ai_api(message, chat_history=None, timeout=30):
     """
     try:
         ai_api_url = os.environ.get('AI_API_URL', 'http://localhost:8001/api/chat/stream')
-        
-        # Формуємо запит
-        payload = {
-            'message': message
-        }
-        
+        history_lines = []
+        for item in chat_history or []:
+            if item.response:
+                history_lines.extend((
+                    f"User: {item.message}",
+                    f"Assistant: {item.response}",
+                ))
+        if history_lines:
+            message = (
+                "Previous conversation:\n"
+                + '\n'.join(history_lines)
+                + "\n\nCurrent user message:\n"
+                + message
+            )
+
+        payload = {'message': message}
         # Викликаємо AI API
         response = requests.post(
             ai_api_url,
@@ -1033,14 +1157,14 @@ def call_ai_api(message, chat_history=None, timeout=30):
         if response.status_code == 200:
             return response.text
         else:
-            print(f"❌ AI API помилка: {response.status_code}")
+            app.logger.error('AI API returned HTTP %s', response.status_code)
             return None
     
     except requests.exceptions.RequestException as e:
-        print(f"❌ Помилка при виклику AI API: {str(e)}")
+        app.logger.error('AI API request failed: %s', e)
         return None
     except Exception as e:
-        print(f"❌ Невідома помилка: {str(e)}")
+        app.logger.exception('Unexpected AI API error: %s', e)
         return None
 
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
@@ -1051,8 +1175,6 @@ def chat_with_ai():
     
     user_id = get_current_user_id(request)
     if not user_id:
-        auth_header = request.headers.get('Authorization', '')
-        print(f"❌ Запит до /api/chat без валідного токена. Auth header: {auth_header[:30] if auth_header else 'відсутній'}...")
         return jsonify({
             'error': 'Не автентифіковано',
             'message': 'Токен не знайдено або він невірний. Переконайтеся, що токен передано у форматі: Authorization: Bearer <TOKEN>'
@@ -1133,10 +1255,10 @@ def chat_with_ai():
             'timestamp': chat_msg.created_at.isoformat()
         }), 200
     
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        print(f"❌ Помилка чату: {str(e)}")
-        return jsonify({'error': f'Помилка чату: {str(e)}'}), 500
+        app.logger.exception('Chat request failed')
+        return jsonify({'error': 'Помилка чату'}), 500
 
 @app.route('/api/chat/history', methods=['GET', 'OPTIONS'])
 def get_chat_history():
@@ -1165,8 +1287,9 @@ def get_chat_history():
             'total': len(chat_history)
         }), 200
     
-    except Exception as e:
-        return jsonify({'error': f'Помилка отримання історії: {str(e)}'}), 500
+    except Exception:
+        app.logger.exception('Chat history retrieval failed')
+        return jsonify({'error': 'Помилка отримання історії чату'}), 500
 
 @app.route('/api/chat/<int:msg_id>', methods=['DELETE', 'OPTIONS'])
 def delete_chat_message(msg_id):
@@ -1191,22 +1314,23 @@ def delete_chat_message(msg_id):
         
         return jsonify({'message': 'Повідомлення видалено'}), 200
     
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': f'Помилка видалення: {str(e)}'}), 500
+        app.logger.exception('Chat message deletion failed')
+        return jsonify({'error': 'Помилка видалення повідомлення'}), 500
 
 # ==================== ОБРОБКА ПОМИЛОК ====================
 
 @app.errorhandler(404)
-def not_found(error):
+def not_found(_):
     return jsonify({'error': 'Маршрут не знайдено'}), 404
 
 @app.errorhandler(413)
-def request_entity_too_large(error):
+def request_entity_too_large(_):
     return jsonify({'error': 'Загальний розмір вкладень не може перевищувати 20 МБ.'}), 413
 
 @app.errorhandler(500)
-def server_error(error):
+def server_error(_):
     return jsonify({'error': 'Помилка сервера'}), 500
 
 # ==================== ЗАПУСК СЕРВЕРА ====================
@@ -1217,11 +1341,12 @@ if __name__ == '__main__':
         db.create_all()
         print("✓ База даних готова")
     
-    port = int(os.environ.get('PORT', 8000))
-    debug_mode = os.environ.get('FLASK_ENV') != 'production'
+    port = int(os.environ.get('PORT', app.config['PORT']))
+    host = os.environ.get('HOST', app.config['HOST'])
+    debug_mode = app.config['DEBUG']
     
     print("🚀 Запуск Flask сервера...")
-    print(f"📍 http://0.0.0.0:{port}")
+    print(f"📍 http://{host}:{port}")
     print("💡 Натисніть Ctrl+C для зупинки\n")
     
-    app.run(debug=debug_mode, host='0.0.0.0', port=port)
+    app.run(debug=debug_mode, host=host, port=port)

@@ -55,7 +55,7 @@ Content-Type: application/json
 
 {
     "login": "username",
-    "password": "password123",
+    "password": "Password123.",
     "email": "user@example.com",
     "first_name": "Іван",
     "last_name": "Петренко",
@@ -90,7 +90,7 @@ Content-Type: application/json
 
 {
     "login": "username",
-    "password": "password123"
+    "password": "Password123."
 }
 ```
 
@@ -168,14 +168,14 @@ Content-Type: multipart/form-data
 
 - Паролі хешуються за допомогою Werkzeug
 - JWT токени видають на 30 днів
-- CORS дозволяє запити з будь-якого джерела (налаштуйте у production)
+- CORS дозволяє запити лише з джерел у `CORS_ORIGINS`
 - Унікальність логіну та email
 
 ## ⚙️ Конфігурація
 
 Для production:
-1. Змініть `SECRET_KEY` на складний набір символів
-2. Встановіть `debug=False`
+1. Встановіть унікальний `SECRET_KEY` та `DATABASE_URL` у середовищі
+2. Встановіть `FLASK_ENV=production` (без цих production-налаштувань сервер не запуститься)
 3. Перевірте параметри CORS
 4. Використовуйте PostgreSQL замість SQLite
 
@@ -198,8 +198,8 @@ DataBase/
 pip install Flask-SQLAlchemy
 ```
 
-**Port 5000 використовується:**
-Змініть `port=5000` на інший порт у Backend.py
+**Порт 8000 використовується:**
+Встановіть інше значення `PORT` у `.env`, наприклад `PORT=8001`.
 
 **CORS помилки:**
 Переконайтесь, що фронтенд відправляє запити на `http://localhost:8000`

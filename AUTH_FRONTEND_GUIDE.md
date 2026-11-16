@@ -94,7 +94,7 @@ interface LoginResponse {
 const response = await fetch('http://backend-url/api/login', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ login: 'user@example.com', password: 'password' })
+  body: JSON.stringify({ login: 'user@example.com', password: 'Password123.' })
 });
 
 const data: LoginResponse = await response.json();
@@ -459,4 +459,3 @@ python Backend.py
 ```
 
 Дебаг-логи покажуть точну причину помилки аутентифікації.
-

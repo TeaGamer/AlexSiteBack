@@ -2,9 +2,14 @@
 
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timezone
 
 db = SQLAlchemy()
+
+
+def utcnow():
+    """Return a naive UTC timestamp for compatibility with existing database columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class User(db.Model):
@@ -20,8 +25,8 @@ class User(db.Model):
     date_of_birth = db.Column(db.Date, nullable=True)
     region = db.Column(db.String(120), nullable=True)  # країна/регіон
     is_active = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, onupdate=utcnow)
     
     def __repr__(self):
         return f'<User {self.login}>'
@@ -74,5 +79,5 @@ class User(db.Model):
     
     def update_last_login(self):
         """Оновлення часу останнього входу"""
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utcnow()
         db.session.commit()

@@ -21,16 +21,26 @@ REM Перевірка та створення віртуального сере
 if not exist "venv" (
     echo [*] Створення віртуального середовища...
     python -m venv venv
+    if errorlevel 1 (
+        echo [!] Не вдалося створити віртуальне середовище
+        pause
+        exit /b 1
+    )
     echo [✓] Віртуальне середовище створено
 )
 
 REM Активація віртуального середовища
 echo [*] Активація віртуального середовища...
 call venv\Scripts\activate.bat
+if %errorlevel% neq 0 (
+    echo [!] Не вдалося активувати віртуальне середовище
+    pause
+    exit /b 1
+)
 
 REM Встановлення залежностей
 echo [*] Встановлення залежностей...
-pip install -r requirements.txt >nul 2>&1
+python -m pip install -r requirements.txt
 
 if %errorlevel% neq 0 (
     echo [!] Помилка при встановленні залежностей
@@ -44,7 +54,8 @@ REM Запуск сервера
 echo.
 echo ====================================
 echo [*] Запуск Flask сервера...
-echo [📍] http://localhost:8000
+if not defined PORT set PORT=8000
+echo [📍] http://localhost:%PORT%
 echo [*] Натисніть Ctrl+C для зупинки
 echo ====================================
 echo.

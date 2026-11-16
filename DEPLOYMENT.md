@@ -46,13 +46,16 @@ git push heroku main
 
 #### Крок 7: Встановлення змінних середовища
 ```bash
-heroku config:set SECRET_KEY="your-super-secret-key"
+heroku config:set SECRET_KEY="<paste generated 64-character value>"
 heroku config:set DATABASE_URL="postgresql://..."  # Якщо використовуєте PostgreSQL
 ```
+Generate a unique secret with `python -c "import secrets; print(secrets.token_hex(32))"`
+and use that value for `SECRET_KEY`; replace the placeholder above.
 
 #### Крок 8: Ініціалізація Бази Даних
+Щоб створити таблиці у one-off dyno без запуску інтерактивного меню:
 ```bash
-heroku run python init_db.py
+heroku run python -c "from init_db import init_db; init_db()"
 ```
 
 Ваш додаток буде доступний на: `https://your-app-name.herokuapp.com`
@@ -119,19 +122,16 @@ sudo systemctl enable backend
 
 ### 1. Оновіть конфіг
 
-[config.py](config.py) - змініть:
-```python
-class ProductionConfig(Config):
-    DEBUG = False
-    SECRET_KEY = os.environ.get('SECRET_KEY')  # ОБОВ'ЯЗКОВО встановите
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL')
-```
+Код конфігурації вже перемикається через `FLASK_ENV`. Для production встановіть
+`FLASK_ENV=production`, унікальний `SECRET_KEY` (щонайменше 32 символи) та
+`DATABASE_URL`. Застосунок завершить запуск із помилкою, якщо секрет або URL БД
+відсутні чи використовується шаблонний секрет.
 
 ### 2. Використовуйте PostgreSQL замість SQLite
 
 ```bash
 # Встановлення
-pip install psycopg2-binary
+pip install "psycopg[binary]"
 
 # Конфігурація
 DATABASE_URL=postgresql://user:password@localhost:5432/mydb
@@ -139,15 +139,9 @@ DATABASE_URL=postgresql://user:password@localhost:5432/mydb
 
 ### 3. Дозвільні CORS
 
-В Backend.py:
-```python
-CORS(app, resources={
-    "*": {
-        "origins": ["https://yourdomain.com", "https://www.yourdomain.com"],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+Передайте дозволені origins через `CORS_ORIGINS`, розділяючи їх комами:
+```bash
+export CORS_ORIGINS="https://yourdomain.com,https://www.yourdomain.com"
 ```
 
 ### 4. Встановіть SSL сертифікат
@@ -165,14 +159,18 @@ sudo certbot certonly --nginx -d yourdomain.com
 ```bash
 # Безпека
 export FLASK_ENV=production
-export SECRET_KEY="very-long-random-string-here"
+# Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+export SECRET_KEY="<paste generated 64-character value>"
 
 # База даних (PostgreSQL)
 export DATABASE_URL="postgresql://user:pass@db.example.com:5432/mydb"
 
 # Сервер
-export FLASK_HOST="0.0.0.0"
-export FLASK_PORT="5000"
+export PORT="8000"
+export HOST="0.0.0.0"
+
+# Дозволені frontend origins
+export CORS_ORIGINS="https://yourdomain.com"
 ```
 
 ## 📊 Рекомендована архітектура Production

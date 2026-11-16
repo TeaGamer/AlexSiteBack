@@ -77,7 +77,7 @@ http://localhost:8000/api/health
 ```powershell
 $body = @{
     login = "testuser"
-    password = "TestPass123"
+    password = "TestPass123."
     email = "test@example.com"
     first_name = "Тест"
     last_name = "Користувач"
@@ -94,7 +94,7 @@ Invoke-WebRequest -Uri "http://localhost:8000/api/register" `
 ```powershell
 $body = @{
     login = "testuser"
-    password = "TestPass123"
+    password = "TestPass123."
 } | ConvertTo-Json
 
 Invoke-WebRequest -Uri "http://localhost:8000/api/login" `
@@ -112,7 +112,7 @@ Invoke-WebRequest -Uri "http://localhost:8000/api/login" `
 ```json
 {
     "login": "newuser",
-    "password": "Password123",
+    "password": "Password123.",
     "email": "newuser@example.com",
     "first_name": "Ім'я",
     "last_name": "Прізвище",
