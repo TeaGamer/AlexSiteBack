@@ -127,6 +127,61 @@ def parse_client_timezone(data):
 
 _calendar_schema_lock = threading.Lock()
 _calendar_schema_checked = False
+_user_schema_lock = threading.Lock()
+_user_schema_checked = False
+
+
+def ensure_user_profile_schema():
+    """Add profile timezone support to databases created before that field existed."""
+    global _user_schema_checked
+    if _user_schema_checked:
+        return
+
+    with _user_schema_lock:
+        if _user_schema_checked:
+            return
+
+        inspector = inspect(db.engine)
+        if 'users' not in inspector.get_table_names():
+            return
+
+        existing_columns = {column['name'] for column in inspector.get_columns('users')}
+        with db.engine.begin() as connection:
+            if 'timezone_name' not in existing_columns:
+                connection.execute(text('ALTER TABLE users ADD COLUMN timezone_name VARCHAR(64) NULL'))
+            connection.execute(text(
+                "UPDATE users SET region = 'Poland' "
+                "WHERE region IS NULL OR TRIM(region) = '' OR TRIM(region) = '-- none --'"
+            ))
+            connection.execute(text(
+                "UPDATE users SET region = 'Ukraine' "
+                "WHERE TRIM(region) IN ("
+                "'Autonomous Republic of Crimea', 'Cherkasy', 'Chernivtsi', "
+                "'Chernihiv', 'Dnipro', 'Donetsk', 'Ivano-Frankivsk', 'Kharkiv', 'Kherson', "
+                "'Khmelnytskyi', 'Kirovohrad', 'Kyiv', 'Lviv', 'Luhansk', 'Mykolaiv', 'Odesa', "
+                "'Poltava', 'Rivne', 'Sumy', 'Ternopil', 'Vinnytsia', 'Volyn', 'Zakarpattia', "
+                "'Zaporizhzhia', 'Zhytomyr') OR TRIM(region) LIKE '%, Ukraine'"
+            ))
+            connection.execute(text(
+                "UPDATE users SET timezone_name = 'Europe/Kyiv' "
+                "WHERE timezone_name IS NULL AND region = 'Ukraine'"
+            ))
+            connection.execute(text(
+                "UPDATE users SET timezone_name = 'Europe/Warsaw' "
+                "WHERE timezone_name IS NULL AND region = 'Poland'"
+            ))
+
+        _user_schema_checked = True
+
+
+def validate_timezone_name(value):
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError('Invalid timezone name.')
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError('Unknown timezone name.') from error
+    return value
 
 def ensure_calendar_schema():
     """Add calendar columns and the legacy-note uniqueness index to existing databases."""
@@ -367,7 +422,8 @@ class User(db.Model):
     first_name = db.Column(db.String(120), nullable = False)
     last_name = db.Column(db.String(120), nullable = False)
     date_of_birth = db.Column(db.String(20))
-    region = db.Column(db.String(120), default = 'Ukraine')
+    region = db.Column(db.String(120), default = 'Poland')
+    timezone_name = db.Column(db.String(64), default = 'Europe/Warsaw')
     is_active = db.Column(db.Boolean, default = True)
     created_at = db.Column(db.DateTime, default = utcnow)
     updated_at = db.Column(db.DateTime, default = utcnow, onupdate = utcnow)
@@ -390,7 +446,7 @@ class User(db.Model):
         return User.query.get(user_id)
     
     @staticmethod
-    def create(login, email, password, first_name, last_name, date_of_birth = None, region = None):
+    def create(login, email, password, first_name, last_name, date_of_birth = None, region = None, timezone_name = 'Europe/Warsaw'):
         """Створення нового користувача"""
         password_hash = generate_password_hash(password)
         user = User(
@@ -400,7 +456,8 @@ class User(db.Model):
             first_name = first_name,
             last_name = last_name,
             date_of_birth = date_of_birth,
-            region = region or 'Ukraine'
+            region = region or 'Poland',
+            timezone_name = timezone_name
         )
         db.session.add(user)
         db.session.commit()
@@ -413,7 +470,7 @@ class User(db.Model):
         if not user:
             return None
         
-        allowed_fields = ['email', 'first_name', 'last_name', 'date_of_birth', 'region', 'password_hash']
+        allowed_fields = ['email', 'first_name', 'last_name', 'date_of_birth', 'region', 'timezone_name', 'password_hash']
         for key, value in kwargs.items():
             if key in allowed_fields and value is not None:
                 setattr(user, key, value)
@@ -446,6 +503,7 @@ class User(db.Model):
             'last_name': self.last_name,
             'date_of_birth': self.date_of_birth,
             'region': self.region,
+            'timezone_name': self.timezone_name,
             'is_active': self.is_active,
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat()
@@ -696,6 +754,16 @@ def get_current_user_id(request):
 
 
 @app.before_request
+def maintain_user_profile_storage():
+    try:
+        ensure_user_profile_schema()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception('User profile storage maintenance failed')
+        return jsonify({'error': 'Не вдалося підготувати профіль користувача'}), 500
+
+
+@app.before_request
 def maintain_calendar_storage():
     if not (request.path.startswith('/api/events') or request.path == '/api/chat/parse-event'):
         return None
@@ -791,9 +859,14 @@ def register():
             return jsonify({'error': 'Ім’я не може бути порожнім'}), 400
         if any(
             field in data and data[field] is not None and not isinstance(data[field], str)
-            for field in ('date_of_birth', 'region')
+            for field in ('date_of_birth', 'region', 'timezone_name')
         ):
             return jsonify({'error': 'Дата народження та регіон мають бути текстом.'}), 400
+        timezone_name = data.get('timezone_name', 'Europe/Warsaw')
+        try:
+            timezone_name = validate_timezone_name(timezone_name)
+        except ValueError:
+            return jsonify({'error': 'Вкажіть коректний часовий пояс IANA.'}), 400
 
         if User.find_by_login(login):
             return jsonify({'error': 'Користувач з таким логіном вже існує'}), 409
@@ -808,7 +881,8 @@ def register():
             first_name = first_name,
             last_name = last_name,
             date_of_birth = data.get('date_of_birth'),
-            region = data.get('region', 'Ukraine')
+            region = data.get('region', 'Poland'),
+            timezone_name = timezone_name
         )
         
         token = generate_token(user.id)
@@ -900,7 +974,7 @@ def update_profile():
             return jsonify({'error': 'Надішліть коректний JSON-об’єкт.'}), 400
         updates = {}
         
-        for field in ('email', 'first_name', 'last_name', 'region', 'date_of_birth'):
+        for field in ('email', 'first_name', 'last_name', 'region', 'date_of_birth', 'timezone_name'):
             nullable = field in ('region', 'date_of_birth')
             if field in data and (
                 (data[field] is None and not nullable)
@@ -927,6 +1001,12 @@ def update_profile():
 
         if 'region' in data:
             updates['region'] = data['region']
+
+        if 'timezone_name' in data:
+            try:
+                updates['timezone_name'] = validate_timezone_name(data['timezone_name'])
+            except ValueError:
+                return jsonify({'error': 'Вкажіть коректний часовий пояс IANA.'}), 400
 
         if 'date_of_birth' in data:
             updates['date_of_birth'] = data['date_of_birth']

@@ -20,6 +20,7 @@ class BackendApiTests(unittest.TestCase):
         self.app_context.push()
         db.drop_all()
         db.create_all()
+        backend_module._user_schema_checked = False
         self.addCleanup(self.app_context.pop)
         self.addCleanup(db.session.remove)
         self.client = app.test_client()
@@ -43,6 +44,78 @@ class BackendApiTests(unittest.TestCase):
             content_type='application/json',
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_profile_saves_and_validates_timezone(self):
+        registration = self.client.post('/api/register', json={
+            'login': 'timezoneuser',
+            'password': 'StrongPass123.',
+            'email': 'timezone@example.com',
+            'first_name': 'Timezone',
+            'region': 'Poland',
+            'timezone_name': 'Europe/Warsaw',
+        })
+        self.assertEqual(registration.status_code, 201, registration.get_json())
+        self.assertEqual(registration.get_json()['user']['timezone_name'], 'Europe/Warsaw')
+        headers = {'Authorization': f"Bearer {registration.get_json()['token']}"}
+
+        updated = self.client.put('/api/profile', headers=headers, json={
+            'region': 'United States',
+            'timezone_name': 'America/New_York',
+        })
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        self.assertEqual(updated.get_json()['user']['region'], 'United States')
+        self.assertEqual(updated.get_json()['user']['timezone_name'], 'America/New_York')
+
+        invalid = self.client.put('/api/profile', headers=headers, json={
+            'timezone_name': 'Mars/Olympus',
+        })
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_user_schema_migrates_timezone_column(self):
+        db.drop_all()
+        with db.engine.begin() as connection:
+            connection.execute(text(
+                'CREATE TABLE users ('
+                'id INTEGER PRIMARY KEY, login VARCHAR(120), password_hash VARCHAR(255), '
+                'email VARCHAR(120), first_name VARCHAR(120), last_name VARCHAR(120), '
+                'date_of_birth VARCHAR(20), region VARCHAR(120), is_active BOOLEAN, '
+                'created_at TIMESTAMP, updated_at TIMESTAMP)'
+            ))
+            connection.execute(text(
+                "INSERT INTO users (id, login, password_hash, email, first_name, last_name, region) "
+                "VALUES (1, 'legacy', 'hash', 'legacy@example.com', 'Legacy', 'User', 'Kyiv')"
+            ))
+            connection.execute(text(
+                "INSERT INTO users (id, login, password_hash, email, first_name, last_name, region) "
+                "VALUES (2, 'unset-region', 'hash', 'unset@example.com', 'Unset', 'Region', ' -- none -- ')"
+            ))
+        backend_module._user_schema_checked = False
+
+        backend_module.ensure_user_profile_schema()
+
+        columns = {column['name'] for column in inspect(db.engine).get_columns('users')}
+        self.assertIn('timezone_name', columns)
+        legacy_user = db.session.execute(text(
+            'SELECT region, timezone_name FROM users WHERE id = 1'
+        )).one()
+        self.assertEqual(legacy_user.region, 'Ukraine')
+        self.assertEqual(legacy_user.timezone_name, 'Europe/Kyiv')
+        default_user = db.session.execute(text(
+            'SELECT region, timezone_name FROM users WHERE id = 2'
+        )).one()
+        self.assertEqual(default_user.region, 'Poland')
+        self.assertEqual(default_user.timezone_name, 'Europe/Warsaw')
+
+    def test_registration_defaults_to_poland_and_warsaw(self):
+        response = self.client.post('/api/register', json={
+            'login': 'defaultregion',
+            'password': 'StrongPass123.',
+            'email': 'default@example.com',
+            'first_name': 'Default',
+        })
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertEqual(response.get_json()['user']['region'], 'Poland')
+        self.assertEqual(response.get_json()['user']['timezone_name'], 'Europe/Warsaw')
 
     def test_database_management_commands(self):
         with redirect_stdout(StringIO()):
