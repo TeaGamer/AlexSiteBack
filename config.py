@@ -13,7 +13,7 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'local-development-key-change-before-deploy'
     
     # JWT
-    JWT_EXPIRATION_HOURS = int(os.environ.get('JWT_EXPIRATION_HOURS', '720'))
+    JWT_EXPIRATION_HOURS = int(os.environ.get('JWT_EXPIRATION_HOURS', '4'))
     
     # Сервер
     HOST = '0.0.0.0'

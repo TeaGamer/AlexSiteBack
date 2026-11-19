@@ -34,8 +34,7 @@ class BackendApiTests(unittest.TestCase):
             'last_name': 'User',
         })
         self.assertEqual(response.status_code, 201, response.get_json())
-        token = response.get_json()['token']
-        return {'Authorization': f'Bearer {token}'}
+        return {}
 
     def test_invalid_json_returns_client_error(self):
         response = self.client.post(
@@ -56,7 +55,7 @@ class BackendApiTests(unittest.TestCase):
         })
         self.assertEqual(registration.status_code, 201, registration.get_json())
         self.assertEqual(registration.get_json()['user']['timezone_name'], 'Europe/Warsaw')
-        headers = {'Authorization': f"Bearer {registration.get_json()['token']}"}
+        headers = {}
 
         updated = self.client.put('/api/profile', headers=headers, json={
             'region': 'United States',

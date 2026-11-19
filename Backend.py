@@ -17,6 +17,9 @@ import requests
 import json
 import zipfile
 import threading
+import secrets
+import smtplib
+from email.message import EmailMessage
 import xml.etree.ElementTree as ElementTree
 from pathlib import PurePath
 from pypdf import PdfReader
@@ -71,8 +74,23 @@ CORS(app,
     resources = {"*": {"origins": cors_origins}},
     supports_credentials=True,
     methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers = ["Content-Type", "Authorization"]
+    allow_headers = ["Content-Type", "Authorization", "X-CSRF-Token", "X-AI-Service-Key"]
 )
+
+RATE_LIMITS = {}
+RATE_LIMIT_LOCK = threading.Lock()
+
+def check_rate_limit(limit = 60, window_seconds = 60):
+    key = request.remote_addr or 'unknown'
+    now = datetime.now(timezone.utc)
+    bucket_key = (request.path, key)
+    with RATE_LIMIT_LOCK:
+        timestamps = RATE_LIMITS.setdefault(bucket_key, [])
+        timestamps[:] = [timestamp for timestamp in timestamps if (now - timestamp).total_seconds() < window_seconds]
+        if len(timestamps) >= limit:
+            return False
+        timestamps.append(now)
+    return True
 
 # Конфігурація БД
 DATABASE_URL = app.config['SQLALCHEMY_DATABASE_URI']
@@ -746,12 +764,57 @@ def verify_token(token):
         return None
 
 def get_current_user_id(request):
-    """Отримання ID поточного користувача з токена"""
-    scheme, separator, token = request.headers.get('Authorization', '').partition(' ')
-    if scheme != 'Bearer' or not separator or not token.strip():
+    """Отримання ID поточного користувача з HttpOnly cookie або Bearer (міграційна сумісність)."""
+    token = request.cookies.get('auth_token')
+    if not token:
+        scheme, separator, header_token = request.headers.get('Authorization', '').partition(' ')
+        if scheme == 'Bearer' and separator:
+            token = header_token.strip()
+    if not token:
         return None
-    return verify_token(token.strip())
+    return verify_token(token)
 
+def set_auth_cookie(response, token, remember = False):
+    lifetime = timedelta(days = 30 if remember else 1)
+    response.set_cookie(
+        'auth_token', token,
+        httponly=True,
+        secure=(environment == 'production'),
+        samesite='Lax',
+        max_age=int(lifetime.total_seconds()),
+        path='/'
+    )
+    return response
+
+def set_csrf_cookie(response):
+    csrf_token = secrets.token_urlsafe(32)
+    response.set_cookie(
+        'csrf_token', csrf_token,
+        httponly=False,
+        secure=(environment == 'production'),
+        samesite='Lax',
+        max_age=24 * 60 * 60,
+        path='/'
+    )
+    response.headers['X-CSRF-Token'] = csrf_token
+    return response
+
+
+@app.before_request
+def enforce_request_security():
+    exempt_paths = {'/api/login', '/api/register', '/api/verify-token', '/api/refresh-token'}
+    if not check_rate_limit(limit = 120 if request.method == 'GET' else 30):
+        return jsonify({'error': 'Забагато запитів. Спробуйте пізніше.'}), 429
+
+    if app.config['TESTING']:
+        return None
+
+    if request.method not in {'GET', 'HEAD', 'OPTIONS'} and request.path not in exempt_paths:
+        csrf_cookie = request.cookies.get('csrf_token')
+        csrf_header = request.headers.get('X-CSRF-Token')
+        if not csrf_cookie or not csrf_header or not secrets.compare_digest(csrf_cookie, csrf_header):
+            return jsonify({'error': 'Перевірка CSRF не пройшла.'}), 403
+    return None
 
 @app.before_request
 def maintain_user_profile_storage():
@@ -784,6 +847,51 @@ def maintain_calendar_storage():
 def health_check():
     """Перевірка стану сервера"""
     return jsonify({'status': 'ok', 'message': 'Backend is running'}), 200
+
+@app.route('/api/notifications/email', methods = ['POST', 'OPTIONS'])
+def send_email_notification():
+    """Надсилання реального e-mail нагадування через налаштований SMTP."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Не автентифіковано'}), 401
+
+    data = get_json_object()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Надішліть коректний JSON'}), 400
+    subject = str(data.get('subject', 'Alex reminder'))[:200]
+    text = str(data.get('text', '')).strip()
+    if not text:
+        return jsonify({'error': 'Текст сповіщення обов’язковий'}), 400
+
+    smtp_host = os.environ.get('SMTP_HOST')
+    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+    smtp_user = os.environ.get('SMTP_USER')
+    smtp_password = os.environ.get('SMTP_PASSWORD')
+    smtp_from = os.environ.get('SMTP_FROM') or smtp_user
+    if not smtp_host or not smtp_user or not smtp_password or not smtp_from:
+        return jsonify({'error': 'SMTP не налаштовано на сервері'}), 503
+
+    user = User.find_by_id(user_id)
+    if not user:
+        return jsonify({'error': 'Користувача не знайдено'}), 404
+
+    message = EmailMessage()
+    message['Subject'] = subject
+    message['From'] = smtp_from
+    message['To'] = user.email
+    message.set_content(text)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(message)
+        return jsonify({'status': 'sent', 'recipient': user.email}), 200
+    except Exception:
+        app.logger.exception('SMTP notification failed')
+        return jsonify({'error': 'Не вдалося надіслати електронного листа'}), 502
 
 @app.route('/api/verify-token', methods = ['GET', 'POST', 'OPTIONS'])
 def verify_token_endpoint():
@@ -887,11 +995,13 @@ def register():
         
         token = generate_token(user.id)
         
-        return jsonify({
+        response = jsonify({
             'message': 'Реєстрація пройшла успішно',
-            'user': user.to_dict(),
-            'token': token
-        }), 201
+            'user': user.to_dict()
+        })
+        set_auth_cookie(response, token)
+        set_csrf_cookie(response)
+        return response, 201
     
     except Exception:
         db.session.rollback()
@@ -926,15 +1036,39 @@ def login():
         
         token = generate_token(user.id)
         
-        return jsonify({
+        response = jsonify({
             'message': 'Вхід успішний',
-            'user': user.to_dict(),
-            'token': token
-        }), 200
+            'user': user.to_dict()
+        })
+        set_auth_cookie(response, token, remember = bool(data.get('remember')))
+        set_csrf_cookie(response)
+        return response, 200
     
     except Exception:
         app.logger.exception('Login failed')
         return jsonify({'error': 'Помилка входу'}), 500
+
+@app.route('/api/refresh-token', methods = ['POST', 'OPTIONS'])
+def refresh_token():
+    if request.method == 'OPTIONS':
+        return '', 200
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return jsonify({'error': 'Сесія недійсна'}), 401
+    token = generate_token(user_id)
+    response = jsonify({'status': 'refreshed'})
+    set_auth_cookie(response, token)
+    set_csrf_cookie(response)
+    return response, 200
+
+@app.route('/api/logout', methods = ['POST', 'OPTIONS'])
+def logout():
+    if request.method == 'OPTIONS':
+        return '', 200
+    response = jsonify({'message': 'Вихід успішний'})
+    response.delete_cookie('auth_token', path='/')
+    response.delete_cookie('csrf_token', path='/')
+    return response, 200
 
 # >>>>>>>>>> ПРОФІЛЬ >>>>>>>>>>
 
@@ -1035,10 +1169,12 @@ def update_profile():
 
 @app.route('/api/users', methods = ['GET', 'OPTIONS'])
 def get_users():
-    """Отримання списку користувачів"""
+    """Отримання списку зареєстрованих користувачів для автентифікованих користувачів."""
     if request.method == 'OPTIONS':
         return '', 200
-    
+    if not get_current_user_id(request):
+        return jsonify({'error': 'Не автентифіковано'}), 401
+
     try:
         users = User.get_all()
         return jsonify({
@@ -1051,10 +1187,12 @@ def get_users():
 
 @app.route('/api/users/<int:user_id>', methods = ['GET', 'OPTIONS'])
 def get_user(user_id):
-    """Отримання інформації про конкретного користувача"""
+    """Отримання інформації про конкретного зареєстрованого користувача"""
     if request.method == 'OPTIONS':
         return '', 200
-    
+    if not get_current_user_id(request):
+        return jsonify({'error': 'Не автентифіковано'}), 401
+
     user = User.find_by_id(user_id)
     if not user:
         return jsonify({'error': 'Користувача не знайдено'}), 404
@@ -1626,11 +1764,21 @@ def call_ai_api(message, chat_history = None, timeout = 30, user_context = None)
         if history_lines:
             context_sections.append("Previous conversation:\n" + '\n'.join(history_lines))
         context_sections.append("Current user message:\n" + message)
-        payload = {'message': '\n\n'.join(context_sections)}
+        payload = {
+            'message': '\n\n'.join(context_sections),
+            'user_id': user_context.get('user_id') if user_context else None,
+        }
         # Викликаємо AI API
+        ai_headers = {}
+        ai_service_key = os.environ.get('AI_SERVICE_API_KEY')
+        if ai_service_key:
+            ai_headers['X-AI-Service-Key'] = ai_service_key
+        if user_context and user_context.get('user_id') is not None:
+            ai_headers['X-User-ID'] = str(user_context['user_id'])
         response = requests.post(
             ai_api_url,
             json = payload,
+            headers = ai_headers,
             timeout = timeout
         )
         
@@ -1722,6 +1870,7 @@ def chat_with_ai():
         user_context = None
         if current_user:
             user_context = {
+                'user_id': current_user.id,
                 'username': current_user.login,
                 'first_name': current_user.first_name,
                 'last_name': current_user.last_name,
