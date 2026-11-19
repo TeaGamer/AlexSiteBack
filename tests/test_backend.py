@@ -302,7 +302,21 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(Event.query.count(), 0)
         self.assertEqual(ChatMessage.query.count(), 0)
 
-    def test_ai_request_includes_previous_conversation(self):
+    def test_ai_request_extracts_json_response(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            'message': 'Hello',
+            'response': 'Clean AI response',
+            'status': 'success',
+        }
+        response.text = '{"message":"Hello","response":"Clean AI response","status":"success"}'
+
+        with patch('Backend.requests.post', return_value=response):
+            result = call_ai_api('Hello')
+
+        self.assertEqual(result, 'Clean AI response')
+
+    def test_ai_request_includes_previous_conversation_and_user_context(self):
         user = User.create(
             login='testuser',
             email='test@example.com',
@@ -313,14 +327,49 @@ class BackendApiTests(unittest.TestCase):
         history = [ChatMessage.create(user.id, 'prior question', 'prior answer')]
         response = Mock(status_code=200, text='response')
 
+        user_context = {
+            'username': 'testuser',
+            'first_name': 'Test',
+            'last_name': 'User',
+            'region': 'Ukraine',
+            'timezone_name': 'Europe/Kyiv',
+        }
         with patch('Backend.requests.post', return_value=response) as post:
-            result = call_ai_api('new question', history)
+            result = call_ai_api('new question', history, user_context=user_context)
 
         self.assertEqual(result, 'response')
         prompt = post.call_args.kwargs['json']['message']
         self.assertIn('prior question', prompt)
         self.assertIn('prior answer', prompt)
         self.assertIn('new question', prompt)
+        self.assertIn('testuser', prompt)
+        self.assertIn('Ukraine', prompt)
+        self.assertIn('Europe/Kyiv', prompt)
+
+    def test_chat_passes_authenticated_user_context_to_ai(self):
+        headers = self.register_user()
+        user = User.find_by_login('testuser')
+        User.update(
+            user.id,
+            region='Ukraine',
+            timezone_name='Europe/Kyiv',
+        )
+
+        with patch('Backend.call_ai_api', return_value='Чиста відповідь') as call_ai:
+            response = self.client.post(
+                '/api/chat',
+                headers=headers,
+                json={'message': 'Які свята в моїй країні?'},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()['ai_response'], 'Чиста відповідь')
+        context = call_ai.call_args.kwargs['user_context']
+        self.assertEqual(context['username'], 'testuser')
+        self.assertEqual(context['first_name'], 'Test')
+        self.assertEqual(context['last_name'], 'User')
+        self.assertEqual(context['region'], 'Ukraine')
+        self.assertEqual(context['timezone_name'], 'Europe/Kyiv')
 
 
 if __name__ == '__main__':

@@ -1595,16 +1595,18 @@ def build_ai_message(message, uploaded_files):
     return '\n\n'.join(sections)
 
 
-def call_ai_api(message, chat_history = None, timeout = 30):
+def call_ai_api(message, chat_history = None, timeout = 30, user_context = None):
     """
     Виклик AI API для отримання відповіді.
-    
+
     Args:
         message: Текст повідомлення від користувача
         chat_history: Історія чату для контексту (опціонально)
-    
+        timeout: Тайм-аут HTTP-запиту до AI-сервісу
+        user_context: Username, ім'я, прізвище, країна та часовий пояс користувача
+
     Returns:
-        Текст відповіді від ШІ або None при помилці
+        Чистий текст відповіді від ШІ або None при помилці
     """
     try:
         ai_api_url = os.environ.get('AI_API_URL', 'http://localhost:8001/api/chat/stream')
@@ -1615,15 +1617,16 @@ def call_ai_api(message, chat_history = None, timeout = 30):
                     f"User: {item.message}",
                     f"Assistant: {item.response}",
                 ))
-        if history_lines:
-            message = (
-                "Previous conversation:\n"
-                + '\n'.join(history_lines)
-                + "\n\nCurrent user message:\n"
-                + message
+        context_sections = []
+        if user_context:
+            context_sections.append(
+                "Authenticated user context (use it only when relevant; do not invent values):\n"
+                + json.dumps(user_context, ensure_ascii=False)
             )
-
-        payload = {'message': message}
+        if history_lines:
+            context_sections.append("Previous conversation:\n" + '\n'.join(history_lines))
+        context_sections.append("Current user message:\n" + message)
+        payload = {'message': '\n\n'.join(context_sections)}
         # Викликаємо AI API
         response = requests.post(
             ai_api_url,
@@ -1632,7 +1635,17 @@ def call_ai_api(message, chat_history = None, timeout = 30):
         )
         
         if response.status_code == 200:
-            return response.text
+            try:
+                json_response = response.json()
+            except requests.exceptions.JSONDecodeError:
+                json_response = None
+
+            if isinstance(json_response, dict):
+                ai_text = json_response.get('response')
+                if isinstance(ai_text, str):
+                    return ai_text
+
+            return response.text if isinstance(response.text, str) else None
         else:
             app.logger.error('AI API returned HTTP %s', response.status_code)
             return None
@@ -1703,9 +1716,19 @@ def chat_with_ai():
 
         stored_message = message or 'Please review the attached document(s).'
         
-        # Отримуємо історію чату для контексту
+        # Отримуємо історію чату та контекст автентифікованого користувача
         chat_history = ChatMessage.find_by_user(user_id, limit = 10)
-        
+        current_user = User.find_by_id(user_id)
+        user_context = None
+        if current_user:
+            user_context = {
+                'username': current_user.login,
+                'first_name': current_user.first_name,
+                'last_name': current_user.last_name,
+                'region': current_user.region,
+                'timezone_name': current_user.timezone_name,
+            }
+
         # Зберігаємо запит без текстового вмісту вкладень
         chat_msg = ChatMessage.create(user_id, stored_message)
         
@@ -1713,7 +1736,8 @@ def chat_with_ai():
         ai_response = call_ai_api(
             build_ai_message(stored_message, uploaded_files),
             chat_history,
-            timeout = 120 if uploaded_files else 30
+            timeout = 120 if uploaded_files else 30,
+            user_context = user_context
         )
         
         if ai_response is None:
