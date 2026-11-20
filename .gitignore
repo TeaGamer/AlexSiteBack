@@ -50,6 +50,7 @@ logs/
 .env
 .env.local
 .env.*.local
+.env.example
 
 # Node modules (якщо слід)
 node_modules/
